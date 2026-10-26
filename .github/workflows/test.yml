@@ -1,0 +1,139 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  sqlite3:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The newest and oldest supported Ruby, not every Ruby: Ransack has no
+      # native code, and the database jobs below run on the Ruby in between.
+      matrix:
+        include:
+          - rails: 8-1-stable
+            ruby: 4.0.1
+          - rails: 8-1-stable
+            ruby: 3.3.10
+    env:
+      DB: sqlite3
+      RAILS: ${{ matrix.rails }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Run tests
+        run: bundle exec rspec
+
+  mysql:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rails:
+          - 8-1-stable
+        ruby:
+          - 3.4.8
+    env:
+      DB: mysql
+      RAILS: ${{ matrix.rails }}
+      MYSQL_USERNAME: root
+      MYSQL_PASSWORD: root
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Startup MySQL
+        run: |
+          sudo systemctl start mysql.service
+      - name: Setup databases
+        run: |
+          mysql --user=root --password=root --host=127.0.0.1 -e 'create database ransack collate utf8_general_ci;';
+          mysql --user=root --password=root --host=127.0.0.1 -e 'use ransack;show variables like "%character%";show variables like "%collation%";';
+      - name: Run tests
+        run: bundle exec rspec
+
+  trilogy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same MySQL server as the mysql jobs; this covers the adapter.
+        rails:
+          - 8-1-stable
+        ruby:
+          - 3.4.8
+    env:
+      DB: trilogy
+      RAILS: ${{ matrix.rails }}
+      MYSQL_USERNAME: root
+      MYSQL_PASSWORD: root
+      MYSQL_HOST: 127.0.0.1
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Startup MySQL
+        run: |
+          sudo systemctl start mysql.service
+      - name: Setup databases
+        run: |
+          mysql --user=root --password=root --host=127.0.0.1 -e 'create database ransack collate utf8_general_ci;';
+      - name: Run tests
+        run: bundle exec rspec
+
+  postgres:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rails:
+          - 8-1-stable
+        ruby:
+          - 3.4.8
+    env:
+      DB: postgres
+      RAILS: ${{ matrix.rails }}
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_HOST: 127.0.0.1
+    services:
+      postgres:
+        image: postgres
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Setup databases
+        run: |
+          psql -h localhost -p 5432 -W postgres -c 'create database ransack;' -U postgres;
+      - name: Run tests
+        run: bundle exec rspec

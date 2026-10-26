@@ -1,0 +1,151 @@
+require 'spec_helper'
+
+module Ransack
+  module Nodes
+    describe Grouping do
+      before do
+        @g = 1
+      end
+
+      let(:context) { Context.for(Person) }
+
+      subject { described_class.new(context) }
+
+      describe '#attribute_method?' do
+        context 'for attributes of the context' do
+          it 'is true' do
+            expect(subject.attribute_method?('name')).to be true
+          end
+
+          context "when the attribute contains '_and_'" do
+            it 'is true' do
+              expect(subject.attribute_method?('terms_and_conditions')).to be true
+            end
+          end
+
+          context "when the attribute contains '_or_'" do
+            it 'is true' do
+              expect(subject.attribute_method?('true_or_false')).to be true
+            end
+          end
+
+          context "when the attribute ends with '_start'" do
+            it 'is true' do
+              expect(subject.attribute_method?('life_start')).to be true
+            end
+          end
+
+          context "when the attribute ends with '_end'" do
+            it 'is true' do
+              expect(subject.attribute_method?('stop_end')).to be true
+            end
+          end
+        end
+
+        context 'with a multiparameter index' do
+          it 'strips the index, then the predicate' do
+            expect(subject.attribute_method?('created_at(1i)')).to be true
+            expect(subject.attribute_method?('name_eq(1)')).to be true
+          end
+
+          it 'is false for an index alone' do
+            expect(subject.attribute_method?('(1i)')).to be false
+          end
+
+          # The key is scanned once for its `(`; the regex this replaced could
+          # re-run from every position (CodeQL rb/polynomial-redos).
+          it 'is false for a long key without an index' do
+            expect(subject.attribute_method?('a' * 10_000)).to be false
+          end
+        end
+
+        context 'for unknown attributes' do
+          it 'is false' do
+            expect(subject.attribute_method?('not_an_attribute')).to be false
+          end
+        end
+      end
+
+      describe '#conditions=' do
+        context 'when conditions are identical' do
+          let(:conditions) do
+            {
+              '0' => {
+                'a' => { '0'=> { 'name' => 'name', 'ransacker_args' => '' } },
+                'p' => 'cont',
+                'v' => { '0' => { 'value' => 'John' } }
+              },
+              '1' => {
+                'a' => { '0' => { 'name' => 'name', 'ransacker_args' => '' } },
+                'p' => 'cont',
+                'v' => { '0' => { 'value' => 'John' } }
+              }
+            }
+          end
+
+          before { subject.conditions = conditions }
+
+          it 'expect duplicates to be removed' do
+            expect(subject.conditions.count).to eq 1
+          end
+        end
+
+        context 'when conditions differ only by ransacker_args' do
+          let(:conditions) do
+            {
+              '0' => {
+                'a' => {
+                  '0' => {
+                    'name' => 'with_arguments',
+                    'ransacker_args' => [1, 2]
+                  }
+                },
+                'p' => 'eq',
+                'v' => { '0' => { 'value' => '10' } }
+              },
+              '1' => {
+                'a' => {
+                  '0' => {
+                    'name' => 'with_arguments',
+                    'ransacker_args' => [3, 4]
+                  }
+                },
+                'p' => 'eq',
+                'v' => { '0' => { 'value' => '10' } }
+              }
+            }
+          end
+
+          before { subject.conditions = conditions }
+
+          it 'expect them to be parsed as different and not as duplicates' do
+            expect(subject.conditions.count).to eq 2
+          end
+        end
+      end
+
+      # Regression test for
+      # https://github.com/activerecord-hackery/ransack/issues/689
+      # A form field built from an aliased attribute has to read its value
+      # back under the alias, or the value is lost between requests.
+      describe "#read_attribute" do
+        let(:conditions) do
+          {
+            '0' => {
+              'a' => { '0' => { 'name' => 'parent_name', 'ransacker_args' => '' } },
+              'p' => 'cont',
+              'v' => { '0' => { 'value' => 'John' } }
+            },
+          }
+        end
+
+        before { subject.conditions = conditions }
+
+        it "reads the value back under both the real name and the alias" do
+          expect(subject.parent_name_cont).to eq("John")
+          expect(subject.daddy_cont).to eq("John")
+        end
+      end
+    end
+  end
+end

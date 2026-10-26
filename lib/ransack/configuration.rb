@@ -1,0 +1,313 @@
+require 'ransack/constants'
+require 'ransack/predicate'
+
+module Ransack
+  module Configuration
+
+    mattr_accessor :predicates, :options
+
+    class PredicateCollection
+      attr_reader :sorted_names_with_underscores, :max_name_length
+
+      def initialize
+        @collection = {}
+        @sorted_names_with_underscores = []
+        @max_name_length = 0
+      end
+
+      delegate :[], :keys, :has_key?, to: :@collection
+
+      def []=(key, value)
+        @sorted_names_with_underscores << [key, '_' + key]
+        @sorted_names_with_underscores.sort! { |(a, _), (b, _)| b.length <=> a.length }
+
+        @max_name_length = key.length if key.length > @max_name_length
+        @collection[key] = value
+      end
+    end
+
+    self.predicates = PredicateCollection.new
+
+    self.options = {
+      search_key: :q,
+      ignore_unknown_conditions: true,
+      hide_sort_order_indicators: false,
+      up_arrow: '&#9660;'.freeze,
+      down_arrow: '&#9650;'.freeze,
+      default_arrow: nil,
+      sanitize_scope_args: true,
+      fields_sort_option: nil,
+      strip_whitespace: true,
+      ignore_blank_values: true,
+      dialect: nil,
+      null_sentinel: nil
+    }
+
+    def configure
+      yield self
+    end
+
+    def add_predicate(name, opts = {})
+      name = name.to_s
+      opts[:name] = name
+
+      if opts[:arel_predicate] && opts[:arel_node]
+        raise ArgumentError,
+          "add_predicate '#{name}' takes :arel_predicate or :arel_node, " \
+          "not both"
+      end
+
+      if opts[:arel_node] && !opts[:arel_node].respond_to?(:call)
+        raise ArgumentError,
+          "add_predicate '#{name}' needs :arel_node to be callable, " \
+          "got #{opts[:arel_node].class}"
+      end
+
+      compounds = opts.delete(:compounds)
+      compounds = true if compounds.nil?
+      compounds = false if opts[:wants_array]
+      # _any/_all are built by appending a suffix to an Arel method name
+      # (see #arel_predicate_with_suffix below), which an arel_node builder
+      # has none of.
+      compounds = false if opts[:arel_node]
+
+      self.predicates[name] = Predicate.new(opts)
+
+      Constants::SUFFIXES.each do |suffix|
+        compound_name = name + suffix
+        self.predicates[compound_name] = Predicate.new(
+          opts.merge(
+            name: compound_name,
+            arel_predicate: arel_predicate_with_suffix(
+              opts[:arel_predicate], suffix
+              ),
+            compound: true
+          )
+        )
+      end if compounds
+    end
+
+    # The default `search_key` name is `:q`. The default key may be overridden
+    # in an initializer file like `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Name the search_key `:query` instead of the default `:q`
+    #   config.search_key = :query
+    # end
+    #
+    # Sometimes there are situations when the default search parameter name
+    # cannot be used, for instance if there were two searches on one page.
+    # Another name can be set using the `search_key` option with Ransack
+    # `ransack`, `search` and `@search_form_for` methods in controllers & views.
+    #
+    # In the controller:
+    # @search = Log.ransack(params[:log_search], search_key: :log_search)
+    #
+    # In the view:
+    # <%= f.search_form_for @search, as: :log_search %>
+    #
+    def search_key=(name)
+      self.options[:search_key] = name
+    end
+
+    # By default Ransack ignores errors if an unknown predicate, condition or
+    # attribute is passed into a search. The default may be overridden in an
+    # initializer file like `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Raise if an unknown predicate, condition or attribute is passed
+    #   config.ignore_unknown_conditions = false
+    # end
+    #
+    def ignore_unknown_conditions=(boolean)
+      self.options[:ignore_unknown_conditions] = boolean
+    end
+
+    # By default Ransack ignores empty predicates. Ransack can also fallback to
+    # a default predicate by setting it in an initializer file
+    # like `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Use the 'eq' predicate if an unknown predicate is passed
+    #   config.default_predicate = 'eq'
+    # end
+    #
+    def default_predicate=(name)
+      self.options[:default_predicate] = name
+    end
+
+    # By default, Ransack displays sort order indicator arrows with HTML codes:
+    #
+    #   up_arrow:   '&#9660;'
+    #   down_arrow: '&#9650;'
+    #
+    # There is also a default arrow which is displayed if a column is not sorted.
+    # By default this is nil so nothing will be displayed.
+    #
+    # Any of the defaults may be globally overridden in an initializer file
+    # like `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Globally set the up arrow to an icon, and the down and default arrows to unicode.
+    #   config.custom_arrows = {
+    #     up_arrow:   '<i class="fa fa-long-arrow-up"></i>',
+    #     down_arrow: 'U+02193',
+    #     default_arrow: 'U+11047'
+    #   }
+    # end
+    #
+    def custom_arrows=(opts = {})
+      self.options[:up_arrow] = opts[:up_arrow].freeze if opts[:up_arrow]
+      self.options[:down_arrow] = opts[:down_arrow].freeze if opts[:down_arrow]
+      self.options[:default_arrow] = opts[:default_arrow].freeze if opts[:default_arrow]
+    end
+
+    # Ransack sanitizes many values in your custom scopes into booleans.
+    # [1, '1', 't', 'T', 'true', 'TRUE'] all evaluate to true.
+    # [0, '0', 'f', 'F', 'false', 'FALSE'] all evaluate to false.
+    #
+    # This default may be globally overridden in an initializer file like
+    # `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Accept my custom scope values as what they are.
+    #   config.sanitize_custom_scope_booleans = false
+    # end
+    #
+    def sanitize_custom_scope_booleans=(boolean)
+      self.options[:sanitize_scope_args] = boolean
+    end
+
+    # The `NULLS FIRST` and `NULLS LAST` options can be used to determine
+    # whether nulls appear before or after non-null values in the sort ordering.
+    #
+    # User may want to configure it like this:
+    #
+    # Ransack.configure do |c|
+    #   c.fields_sort_option = :nulls_first # or e.g. :nulls_always_last
+    # end
+    #
+    # Emitted through Arel's `nulls_first` / `nulls_last`, so it works on any
+    # backend Arel supports it for. MySQL has no NULLS FIRST / LAST syntax and
+    # Arel does not emulate it, so this option does not apply there.
+    #
+    # See https://www.postgresql.org/docs/current/queries-order.html
+    #
+    def fields_sort_option=(setting)
+      self.options[:fields_sort_option] = setting
+    end
+
+    # Renamed to `fields_sort_option` now that NULLS FIRST / NULLS LAST is
+    # emitted through Arel and is no longer PostgreSQL-specific. The old name
+    # still works so existing initializers keep running.
+    def postgres_fields_sort_option=(setting)
+      self.fields_sort_option = setting
+    end
+
+    # By default, Ransack displays sort order indicator arrows in sort links.
+    # The default may be globally overridden in an initializer file like
+    # `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Hide sort link order indicators globally across the application
+    #   config.hide_sort_order_indicators = true
+    # end
+    #
+    def hide_sort_order_indicators=(boolean)
+      self.options[:hide_sort_order_indicators] = boolean
+    end
+
+    # By default, Ransack displays strips all whitespace when searching for a string.
+    # The default may be globally changed in an initializer file like
+    # `config/initializers/ransack.rb` as follows:
+    #
+    # Ransack.configure do |config|
+    #   # Enable whitespace stripping for string searches
+    #   config.strip_whitespace = true
+    # end
+    #
+    def strip_whitespace=(boolean)
+      self.options[:strip_whitespace] = boolean
+    end
+
+    # By default, Ransack ignores search conditions whose value is blank — an
+    # empty string, or an array containing only blank values. This is what makes
+    # a search form submitted with empty fields return every record rather than
+    # none, and it is almost always what an HTML form wants.
+    #
+    # Set this to false to treat a blank value as a value to search *for*:
+    # `name_eq: ''` then generates `WHERE name = ''`, and `id_in: []` generates a
+    # condition matching nothing rather than being dropped. This is usually what
+    # a JSON API wants, where an empty value is an explicit filter rather than an
+    # untouched form field.
+    #
+    # A `nil` value is ignored either way.
+    #
+    # Ransack.configure do |config|
+    #   config.ignore_blank_values = false
+    # end
+    #
+    def ignore_blank_values=(boolean)
+      self.options[:ignore_blank_values] = boolean
+    end
+
+    # Ransack works out which SQL dialect a model's database speaks from the
+    # connection adapter's class: PostgreSQL, MySQL (mysql2 and trilogy) and
+    # SQLite are recognised, as is any adapter that subclasses one of them,
+    # and anything else uses standard SQL only. For an adapter that speaks a
+    # known dialect without inheriting from Rails' adapter for it, name the
+    # dialect explicitly:
+    #
+    # Ransack.configure do |config|
+    #   config.dialect = :postgresql # or :mysql, :sqlite, :generic
+    # end
+    #
+    def dialect=(name)
+      self.options[:dialect] = name&.to_sym
+    end
+
+    # Unset by default, so no application changes behavior on upgrade. Set
+    # this to a unique String value that cannot occur in your data, and an
+    # `eq` or `in` predicate (including their `_any` compounds) treats it as
+    # a request to also match `NULL`, instead of as a literal value to
+    # search for. A blank String, `false`, or a non-String value is not
+    # supported and produces undefined behavior:
+    #
+    # Ransack.configure do |config|
+    #   config.null_sentinel = '__ransack_null__'
+    # end
+    #
+    #   name_in: ['Ernie']              # name IN ('Ernie')
+    #   name_in: ['Ernie', '__ransack_null__']
+    #                                   # (name IN ('Ernie') OR name IS NULL)
+    #   name_in: ['__ransack_null__']   # name IS NULL
+    #
+    # A single multi-value form field can express all three states this
+    # way, with no change to the field's name and no controller-side
+    # rewriting. `eq` takes one value, so through it the sentinel means
+    # `IS NULL` alone; "a value or NULL" from one field needs `in` or an
+    # `_any` compound.
+    #
+    # This does not bypass `ransackable_attributes`: `NULL` on an exposed
+    # attribute is already reachable through the built-in `null` predicate.
+    #
+    # See https://github.com/activerecord-hackery/ransack/issues/940
+    #
+    def null_sentinel=(value)
+      self.options[:null_sentinel] = value
+    end
+
+    def arel_predicate_with_suffix(arel_predicate, suffix)
+      # `arel_predicate === Proc` reads as a class check, but `Proc#===` is
+      # an alias for `#call`: it invokes the proc, passing the `Proc`
+      # class itself as the argument, and branches on whatever comes
+      # back. `#respond_to?(:call)` is a real check.
+      if arel_predicate.respond_to?(:call)
+        proc { |v| "#{arel_predicate.call(v)}#{suffix}" }
+      else
+        "#{arel_predicate}#{suffix}"
+      end
+    end
+
+  end
+end

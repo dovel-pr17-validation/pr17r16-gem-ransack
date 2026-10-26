@@ -1,0 +1,354 @@
+require 'spec_helper'
+
+module Ransack
+  module ActiveRecord
+    describe Context do
+      subject { Context.new(Person) }
+
+      describe '#type_for' do
+        # The metadata lookup goes through the pool's schema cache rather than
+        # a leased connection, so an application that avoids permanent
+        # connection checkouts is not handed one behind its back.
+        it 'reads column metadata without leasing a connection' do
+          pool = ::ActiveRecord::Base.connection_pool
+          pool.release_connection
+          expect(pool.active_connection?).to be_falsey
+
+          search = Search.new(Person, name_eq: 'x', context: subject)
+          attribute = search.base.conditions.first.attributes.first
+
+          expect(subject.type_for(attribute)).to eq :string
+          expect(pool.active_connection?).to be_falsey
+        end
+      end
+
+      describe '#type_for with the Attributes API' do
+        # A column redeclared with `attribute` is cast by its declared type,
+        # not the schema column's (#1028).
+        let(:model) do
+          Class.new(Person) do
+            def self.name
+              'PersonWithDatetimeStart'
+            end
+            attribute :life_start, :datetime
+          end
+        end
+
+        it 'reports the declared type' do
+          search = Search.new(model, life_start_gteq: Time.utc(2020, 5, 31, 21, 57, 43))
+          attribute = search.base.conditions.first.attributes.first
+          expect(search.context.type_for(attribute)).to eq :datetime
+          expect(search.result.to_sql).to include('21:57:43')
+        end
+
+        it 'still reports the column type without a declaration' do
+          search = Search.new(Person, life_start_gteq: '2020-05-31')
+          attribute = search.base.conditions.first.attributes.first
+          expect(search.context.type_for(attribute)).to eq :date
+        end
+      end
+
+      describe '#type_for on a table the schema cache does not list' do
+        # #1770: a temporary table is queryable but is not a data source the
+        # schema cache knows about, so the search raised "No table named
+        # temp_widgets exists." (#657).
+        context 'a temporary table' do
+          before(:all) do
+            ::ActiveRecord::Base.lease_connection.create_table(:temp_widgets, temporary: true, force: true) do |t|
+              t.string :name
+            end
+          end
+          after(:all) { ::ActiveRecord::Base.lease_connection.drop_table(:temp_widgets, if_exists: true) }
+          before { stub_const('TempWidget', Class.new(ApplicationRecord) { self.table_name = 'temp_widgets' }) }
+
+          it 'can be searched' do
+            TempWidget.create!(name: 'sprocket')
+            expect(TempWidget.ransack(name_cont: 'rock').result.pluck(:name)).to eq ['sprocket']
+          end
+        end
+
+        # #1770: SQLite matches table names case-insensitively, so a model
+        # whose table_name is "widgets" queries a table created as "Widgets",
+        # but the schema cache lookup is case-sensitive (#668).
+        context 'a table whose name differs only in case', if: RansackHelper.dialect.sqlite? do
+          before(:all) do
+            ::ActiveRecord::Base.lease_connection.create_table(:Widgets, force: true) { |t| t.string :name }
+          end
+          after(:all) { ::ActiveRecord::Base.lease_connection.drop_table(:Widgets, if_exists: true) }
+          before { stub_const('Widget', Class.new(ApplicationRecord) { self.table_name = 'widgets' }) }
+
+          it 'can be searched like Active Record queries it' do
+            Widget.create!(name: 'sprocket')
+            expect(Widget.where(name: 'sprocket').count).to eq 1
+            expect(Widget.ransack(name_cont: 'rock').result.pluck(:name)).to eq ['sprocket']
+          end
+        end
+
+        # A table that really is missing still fails, with Active Record's
+        # own error rather than one of Ransack's.
+        context 'a table that does not exist' do
+          before { stub_const('MissingWidget', Class.new(ApplicationRecord) { self.table_name = 'missing_widgets' }) }
+
+          it 'raises the error Active Record raises for it' do
+            expect { MissingWidget.ransack(name_cont: 'rock').result.to_a }
+              .to raise_error(::ActiveRecord::StatementInvalid, /missing_widgets/)
+          end
+        end
+      end
+
+      describe 'a polymorphic association name with no _of_Model_type suffix' do
+        # `notable_id_or_id` starts with the polymorphic association's name;
+        # walking into it used to ask the reflection for a class (#1267).
+        it 'is treated as attribute names, not as the association' do
+          sql = Note.ransack(notable_id_or_id_eq: 3).result.to_sql
+          notes = quote_table_name('notes')
+          expect(sql).to include(
+            "#{notes}.#{quote_column_name('notable_id')} = 3 OR #{notes}.#{quote_column_name('id')} = 3"
+          )
+        end
+
+        it 'still walks into the association when the class is named' do
+          sql = Note.ransack(notable_of_Person_type_name_eq: 'x').result.to_sql
+          expect(sql).to include("#{quote_table_name('people')}.#{quote_column_name('name')} = 'x'")
+        end
+      end
+
+      it 'has an Active Record alias tracker method' do
+        expect(subject.alias_tracker)
+        .to be_an ::ActiveRecord::Associations::AliasTracker
+      end
+
+      describe '#relation_for' do
+        it 'returns relation for given object' do
+          expect(subject.object).to be_an ::ActiveRecord::Relation
+        end
+      end
+
+      describe '#evaluate' do
+        it 'evaluates search objects' do
+          s = Search.new(Person, name_eq: 'Joe Blow')
+          result = subject.evaluate(s)
+
+          expect(result).to be_an ::ActiveRecord::Relation
+          expect(result.to_sql)
+          .to match /#{quote_column_name("name")} = 'Joe Blow'/
+        end
+
+        it 'SELECTs DISTINCT when distinct: true' do
+          s = Search.new(Person, name_eq: 'Joe Blow')
+          result = subject.evaluate(s, distinct: true)
+
+          expect(result).to be_an ::ActiveRecord::Relation
+          expect(result.to_sql).to match /SELECT DISTINCT/
+        end
+      end
+
+      describe '#build_correlated_subquery' do
+        it 'build correlated subquery for Root STI model' do
+          search = Search.new(Person, { articles_title_not_eq: 'some_title' }, context: subject)
+          attribute = search.conditions.first.attributes.first
+          subquery = subject.build_correlated_subquery(attribute.parent)
+          constraints = subquery.constraints
+          constraint = constraints.first
+
+          # The correlation, then the join's own condition: Article's
+          # default scope.
+          expect(constraints.length).to eql 2
+          expect(subject.subquery_sql(subquery)).to end_with "AND ('default_scope' = 'default_scope')"
+          expect(constraint.left.name).to eql 'person_id'
+          expect(constraint.left.relation.name).to eql 'articles'
+          expect(constraint.right.name).to eql 'id'
+          expect(constraint.right.relation.name).to eql 'people'
+        end
+
+        it 'build correlated subquery for Child STI model when predicate is not_eq' do
+          search = Search.new(Person, { story_articles_title_not_eq: 'some_title' }, context: subject)
+          attribute = search.conditions.first.attributes.first
+          subquery = subject.build_correlated_subquery(attribute.parent)
+          constraints = subquery.constraints
+          constraint = constraints.first
+
+          # The STI type condition and the default scope come with it.
+          expect(constraints.length).to eql 3
+          expect(subject.subquery_sql(subquery)).to include("#{quote_table_name('articles')}.#{quote_column_name('type')} = 'StoryArticle'")
+          expect(constraint.left.relation.name).to eql 'articles'
+          expect(constraint.left.name).to eql 'person_id'
+          expect(constraint.right.relation.name).to eql 'people'
+          expect(constraint.right.name).to eql 'id'
+        end
+
+        it 'build correlated subquery for Child STI model when predicate is eq' do
+          search = Search.new(Person, { story_articles_title_not_eq: 'some_title' }, context: subject)
+          attribute = search.conditions.first.attributes.first
+          subquery = subject.build_correlated_subquery(attribute.parent)
+          constraints = subquery.constraints
+          constraint = constraints.first
+
+          # The STI type condition and the default scope come with it.
+          expect(constraints.length).to eql 3
+          expect(subject.subquery_sql(subquery)).to include("#{quote_table_name('articles')}.#{quote_column_name('type')} = 'StoryArticle'")
+          expect(constraint.left.relation.name).to eql 'articles'
+          expect(constraint.left.name).to eql 'person_id'
+          expect(constraint.right.relation.name).to eql 'people'
+          expect(constraint.right.name).to eql 'id'
+        end
+
+        it 'build correlated subquery for multiple conditions (default scope)' do
+          search = Search.new(Person, { comments_body_not_eq: 'some_title' })
+
+          # Was
+          # SELECT "people".* FROM "people" WHERE "people"."id" NOT IN (
+          #   SELECT "comments"."disabled" FROM "comments"
+          #   WHERE "comments"."disabled" = "people"."id"
+          #     AND NOT ("comments"."body" != 'some_title')
+          # ) ORDER BY "people"."id" DESC
+          # Should Be
+          # SELECT "people".* FROM "people" WHERE "people"."id" NOT IN (
+          #   SELECT "comments"."person_id" FROM "comments"
+          #   WHERE "comments"."person_id" = "people"."id"
+          #     AND NOT ("comments"."body" != 'some_title')
+          # ) ORDER BY "people"."id" DESC
+
+          expect(search.result.to_sql).to match /.comments.\..person_id. = .people.\..id./
+        end
+
+        it 'handles Arel::Nodes::And with children' do
+          # Create a mock Arel::Nodes::And with children for testing
+          search = Search.new(Person, { articles_title_not_eq: 'some_title', articles_body_not_eq: 'some_body' }, context: subject)
+          attribute = search.conditions.first.attributes.first
+          subquery = subject.build_correlated_subquery(attribute.parent)
+          constraints = subquery.constraints
+          constraint = constraints.first
+
+          # The correlation, then the join's own condition: Article's
+          # default scope.
+          expect(constraints.length).to eql 2
+          expect(subject.subquery_sql(subquery)).to end_with "AND ('default_scope' = 'default_scope')"
+          expect(constraint.left.name).to eql 'person_id'
+          expect(constraint.left.relation.name).to eql 'articles'
+          expect(constraint.right.name).to eql 'id'
+          expect(constraint.right.relation.name).to eql 'people'
+        end
+
+        it 'correctly extracts correlated key from complex AND conditions' do
+          # Test with multiple nested conditions to ensure the children traversal works
+          search = Search.new(
+            Person,
+            {
+              articles_title_not_eq: 'title',
+              articles_body_not_eq: 'body',
+              articles_published_eq: true
+            },
+            context: subject
+          )
+
+          attribute = search.conditions.first.attributes.first
+          subquery = subject.build_correlated_subquery(attribute.parent)
+          constraints = subquery.constraints
+          constraint = constraints.first
+
+          expect(constraints.length).to eql 2
+          expect(constraint.left.relation.name).to eql 'articles'
+          expect(constraint.left.name).to eql 'person_id'
+          expect(constraint.right.relation.name).to eql 'people'
+          expect(constraint.right.name).to eql 'id'
+        end
+
+        it 'build correlated subquery for polymorphic & default_scope when predicate is not_cont_all' do
+          search = Search.new(Article,
+           g: [
+             {
+               m: "and",
+               c: [
+                 {
+                   a: ["recent_notes_note"],
+                   p: "not_eq",
+                   v: ["some_note"],
+                 }
+               ]
+             }
+           ],
+          )
+
+          expect(search.result.to_sql).to match /(.notes.\..note. != \'some_note\')/
+        end
+      end
+
+      describe 'sharing context across searches' do
+        let(:shared_context) { Context.for(Person) }
+
+        before do
+          Search.new(Person, { parent_name_eq: 'A' },
+            context: shared_context)
+          Search.new(Person, { children_name_eq: 'B' },
+            context: shared_context)
+        end
+
+        describe '#join_sources' do
+          it 'returns dependent arel join nodes for all searches run against
+          the context' do
+            parents, children = shared_context.join_sources
+            expect(children.left.name).to eq "children_people"
+            expect(parents.left.name).to eq "parents_people"
+          end
+
+          # The relation's own symbol joins were handed to join_constraints,
+          # which only takes stashed join dependencies (#1659).
+          it 'works when the current scope already has joins' do
+            sql = Article.joins(:person).scoping do
+              context = Context.for(Article)
+              searches = [
+                Search.new(Article, { title_eq: 'A' }, context: context),
+                Search.new(Article, { title_eq: 'B' }, context: context)
+              ]
+              conditions = searches.map { |s| Visitor.new.accept(s.base) }
+              Article.joins(context.join_sources).where(conditions.reduce(&:or)).to_sql
+            end
+            title = "#{quote_table_name('articles')}.#{quote_column_name('title')}"
+            expect(sql).to include("INNER JOIN #{quote_table_name('people')}")
+            expect(sql).to include("#{title} = 'A' OR #{title} = 'B'")
+          end
+
+          it 'can be rejoined to execute a valid query' do
+            parents, children = shared_context.join_sources
+
+            expect { Person.joins(parents).joins(children).to_a }
+            .to_not raise_error
+          end
+        end
+      end
+
+      it 'contextualizes strings to attributes' do
+        attribute = subject.contextualize 'children_children_parent_name'
+        expect(attribute).to be_a Arel::Attributes::Attribute
+        expect(attribute.name.to_s).to eq 'name'
+        expect(attribute.relation.table_alias).to eq 'parents_people'
+      end
+
+      it 'builds new associations if not yet built' do
+        attribute = subject.contextualize 'children_articles_title'
+        expect(attribute).to be_a Arel::Attributes::Attribute
+        expect(attribute.name.to_s).to eq 'title'
+        expect(attribute.relation.name).to eq 'articles'
+        expect(attribute.relation.table_alias).to be_nil
+      end
+
+      describe '#type_for' do
+        it 'returns nil when column does not exist instead of raising NoMethodError' do
+          # Create a mock attribute that references a non-existent column
+          mock_attr = double('attribute')
+          allow(mock_attr).to receive(:valid?).and_return(true)
+
+          mock_arel_attr = double('arel_attribute')
+          allow(mock_arel_attr).to receive(:relation).and_return(Person.arel_table)
+          allow(mock_arel_attr).to receive(:name).and_return('nonexistent_column')
+          allow(mock_attr).to receive(:arel_attribute).and_return(mock_arel_attr)
+          allow(mock_attr).to receive(:klass).and_return(Person)
+
+          # This should return nil instead of raising an error
+          expect(subject.type_for(mock_attr)).to be_nil
+        end
+      end
+    end
+  end
+end

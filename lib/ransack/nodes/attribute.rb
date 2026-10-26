@@ -1,0 +1,68 @@
+module Ransack
+  module Nodes
+    class Attribute < Node
+      include Bindable
+
+      attr_reader :name, :ransacker_args
+
+      delegate :blank?, :present?, to: :name
+      delegate :engine, to: :context
+
+      def initialize(context, name = nil, ransacker_args = [])
+        super(context)
+        self.name = name unless name.blank?
+        @ransacker_args = ransacker_args
+      end
+
+      def name=(name)
+        @name = name
+      end
+
+      def valid?
+        bound? && attr &&
+        context.ransackable_attribute?(attr_name.split('.').last, context.klassify(parent))
+      end
+
+      def associated_collection?
+        parent.respond_to?(:reflection) && parent.reflection.collection?
+      end
+
+      def type
+        if ransacker
+          ransacker.type
+        elsif enum?
+          :enum
+        else
+          context.type_for(self)
+        end
+      end
+
+      def eql?(other)
+        self.class == other.class &&
+        self.name == other.name
+      end
+      alias :== :eql?
+
+      def hash
+        self.name.hash
+      end
+
+      def persisted?
+        false
+      end
+
+      def inspect
+        "Attribute <#{name}>"
+      end
+
+      private
+
+      def enum?
+        bound? &&
+        klass.respond_to?(:defined_enums) &&
+        klass.defined_enums.key?(attr_name.to_s)
+      end
+
+    end
+  end
+end

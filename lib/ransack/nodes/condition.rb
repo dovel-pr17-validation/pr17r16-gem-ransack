@@ -1,0 +1,723 @@
+require 'ransack/errors'
+
+module Ransack
+  module Nodes
+    class Condition < Node
+      i18n_word :attribute, :predicate, :combinator, :value
+      i18n_alias a: :attribute, p: :predicate,
+                 m: :combinator, v: :value
+
+      attr_accessor :predicate
+
+      # The effective null sentinel, captured when the condition is built. A
+      # Context can be shared by several searches, each with its own
+      # per-search override; reading the context lazily at SQL generation or
+      # form rendering time would let a later search's setting rewrite an
+      # earlier search's conditions.
+      attr_reader :null_sentinel
+
+      def initialize(context)
+        super
+        @null_sentinel = context&.null_sentinel
+      end
+
+      class << self
+        def extract(context, key, values)
+          attributes, predicate, combinator =
+            extract_values_for_condition(key, context)
+
+          if attributes.size > 0 && predicate
+            condition = self.new(context)
+            condition.build(
+              a: attributes,
+              p: predicate.name,
+              m: combinator,
+              v: predicate.wants_array ? Array(values) : [values]
+            )
+            # An Array given to a single-value predicate is spread into
+            # several values by #build, so it fails the arity check here the
+            # same way the c: form does (#1772).
+            if condition.arity_failure?
+              raise condition.arity_error if context&.strict_conditions?
+              nil
+            # TODO: Figure out what to do with multiple types of attributes,
+            # if anything. Tempted to go with "garbage in, garbage out" here.
+            elsif predicate.validate(condition.values, condition.default_type, condition.null_sentinel)
+              condition
+            else
+              nil
+            end
+          end
+        end
+
+        private
+
+          def extract_values_for_condition(key, context = nil)
+            str = key.dup
+            name = Predicate.detect_and_strip_from_string!(str)
+            predicate = Predicate.named(name)
+
+            unless predicate || Ransack.options[:ignore_unknown_conditions]
+              raise InvalidSearchError, "No valid predicate for #{key}"
+            end
+
+            if context.present?
+              str = context.resolve_aliases(str)
+            end
+
+            # A name that is an attribute in its own right is never split,
+            # whatever it contains.
+            if context.present? && context.attribute_method?(str)
+              attributes = [str]
+              combinator = nil
+            else
+              combinator = combinator_in(str, context)
+              attributes = str.split(/_and_|_or_/)
+            end
+
+            [attributes, predicate, combinator]
+          end
+
+          # A condition name carries one combinator: `a_or_b_or_c` or
+          # `a_and_b`. There is no grammar for precedence between the two,
+          # so a name using both is rejected under a strict search rather
+          # than silently applying whichever came first to every attribute
+          # (#1019). Mixed logic is what groupings are for.
+          def combinator_in(str, context)
+            combinators = str.scan(/_(or|and)_/).flatten.uniq
+            if combinators.size > 1 && context&.strict_conditions?
+              raise InvalidSearchError,
+                "Mixed combinators in #{str}: a condition name may use " \
+                "_and_ or _or_ but not both; use groupings for mixed logic"
+            end
+            combinators.first
+          end
+      end
+
+      def valid?
+        attributes.detect(&:valid?) && predicate && valid_arity? &&
+          predicate.validate(values, default_type, null_sentinel) && valid_combinator?
+      end
+
+      def valid_arity?
+        values.size <= 1 || predicate.wants_array
+      end
+
+      # A single-value predicate given several values is worth naming, so a
+      # strict search can say why the condition was dropped (#1724). It only
+      # counts once the predicate and an attribute have resolved; a condition
+      # that is invalid for another reason is not an arity failure.
+      def arity_failure?
+        predicate && attributes.any?(&:valid?) && !valid_arity?
+      end
+
+      def arity_error
+        InvalidSearchError.new(
+          "Predicate #{predicate_name} takes a single value, " \
+          "#{values.size} given for #{attributes.map(&:name).join(', ')}"
+        )
+      end
+
+      def attributes
+        @attributes ||= []
+      end
+      alias :a :attributes
+
+      def attributes=(args)
+        case args
+        when Array
+          args.each do |attr|
+            if attr.is_a?(Hash) && (attr.key?(:name) || attr.key?("name"))
+              attr = attr.with_indifferent_access
+              build_attributes(attr[:name], attr[:ransacker_args])
+            else
+              build_attributes(attr)
+            end
+          end
+        when Hash
+          args.each do |index, attrs|
+            attrs = indifferent_params(attrs, 'attribute')
+            build_attributes(attrs[:name], attrs[:ransacker_args])
+          end
+        else
+          raise InvalidSearchError,
+            "Invalid argument (#{args.class}) supplied to attributes="
+        end
+      end
+      alias :a= :attributes=
+
+      def values
+        @values ||= []
+      end
+      alias :v :values
+
+      def values=(args)
+        case args
+        when Array
+          args.each do |val|
+            if val.is_a?(Hash) && (val.key?(:value) || val.key?("value"))
+              val = val.with_indifferent_access[:value]
+            end
+            self.values << Value.new(@context, val)
+          end
+        when Hash
+          args.each do |index, attrs|
+            val = Value.new(@context, indifferent_params(attrs, 'value')[:value])
+            self.values << val
+          end
+        else
+          raise InvalidSearchError,
+            "Invalid argument (#{args.class}) supplied to values="
+        end
+      end
+      alias :v= :values=
+
+      # A supplied combinator wins; the one an expanded alias carried is the
+      # fallback, so `a: { '0' => { name: 'term' } }` with `term` aliasing
+      # `name_or_email` ORs its two attributes without an `m` in the params.
+      # The fallback covers a missing or blank `m` only: an unknown one that
+      # `Node#combinator=` normalised to nil still fails `valid_combinator?`,
+      # as it does for any other multi-attribute condition.
+      def combinator
+        return nil unless @attributes.size > 1
+
+        @combinator || (@alias_combinator unless @combinator_supplied)
+      end
+
+      def combinator=(val)
+        super
+        @combinator_supplied = !val.to_s.strip.empty?
+      end
+
+      alias :m= :combinator=
+      alias :m :combinator
+
+      # == build_attribute
+      #
+      #  This method was originally called from Nodes::Grouping#new_condition
+      #  only, without arguments, without #valid? checking, to build a new
+      #  grouping condition.
+      #
+      #  After refactoring in 235eae3, it is now called from 2 places:
+      #
+      #  1. Nodes::Condition#attributes=, with +name+ argument passed or +name+
+      #     and +ransacker_args+. Attributes are included only if #valid?.
+      #
+      #  2. Nodes::Grouping#new_condition without arguments. In this case, the
+      #     #valid? conditional needs to be bypassed, otherwise nothing is
+      #     built. The `name.nil?` conditional below currently does this.
+      #
+      #  TODO: Add test coverage for this behavior and ensure that `name.nil?`
+      #  isn't fixing issue #701 by introducing untested regressions.
+      #
+      # An attribute named in advanced-search params (`a: { '0' => { name:
+      # 'term' } }`) arrives raw, unlike a simple key, which `Condition.extract`
+      # resolves before it gets here. So a `ransack_alias` is expanded here the
+      # same way: an alias to one attribute is built under that name, and an
+      # alias to a compound becomes one attribute per segment, joined by the
+      # compound's combinator (#1728). Left alone, the alias passed `valid?`
+      # by being allowlisted and bound a column that does not exist.
+      def build_attributes(name, ransacker_args = [])
+        scalar_param(name, 'an attribute name')
+        return build_attribute(name, ransacker_args) if name.blank? || @context.nil?
+
+        resolved = @context.resolve_aliases(name.to_s)
+        if resolved == name.to_s || @context.attribute_method?(resolved)
+          build_attribute(resolved, ransacker_args)
+        else
+          @alias_combinator = resolved[/_(or|and)_/, 1]
+          resolved.split(/_and_|_or_/).each { |segment| build_attribute(segment, ransacker_args) }
+        end
+      end
+
+      def build_attribute(name = nil, ransacker_args = [])
+        Attribute.new(@context, name, ransacker_args).tap do |attribute|
+          @context.bind(attribute, attribute.name)
+          self.attributes << attribute if name.nil? || attribute.valid?
+        end
+      end
+
+      def build_value(val = nil)
+        Value.new(@context, val).tap do |value|
+          self.values << value
+        end
+      end
+
+      def value
+        if predicate.wants_array
+          values.map { |v| cast_unless_null_sentinel(v) }
+        else
+          cast_unless_null_sentinel(values.first)
+        end
+      end
+
+      # Casting the sentinel here would turn it into a real value on a
+      # typed column (e.g. an integer column casts it to 0), so a form
+      # re-rendering this condition's current value would resubmit that
+      # literal instead of the sentinel.
+      def cast_unless_null_sentinel(v)
+        if Constants.null_sentinel_predicate?(predicate.name, null_sentinel) &&
+           Constants.null_sentinel_value?(v.value, null_sentinel)
+          v.value
+        else
+          v.cast(default_type)
+        end
+      end
+
+      # The long spellings route through the short setters: `p=` resolves a
+      # Predicate object, whereas the `predicate=` attribute writer would store
+      # the bare name. `predicate_name` is the spelling the ransacker docs
+      # used for years, so it is accepted too (#1009).
+      LONG_KEYS = {
+        'attributes' => 'a', 'values' => 'v', 'predicate' => 'p',
+        'predicate_name' => 'p', 'combinator' => 'm'
+      }.freeze
+
+      def build(params)
+        indifferent_params(params, 'condition').each do |key, value|
+          if key.match(/\A(a|v|p|m|attributes|values|predicate|predicate_name|combinator)\z/)
+            self.send("#{LONG_KEYS.fetch(key, key)}=", value)
+          end
+        end
+        spread_array_values!
+
+        self
+      end
+
+      # An Array held by one value stands for several values: `[5, 6]` in one
+      # envelope of the c: form (#1771), or `name_eq: ['a', 'b']` in the short
+      # form, as a group of check boxes posts it (#1772). Cast as one value it
+      # became nil on a typed column, dropping the condition, or its string
+      # form elsewhere. Each element becomes a value of its own instead, so a
+      # predicate that wants an array gets them all, and a single-value
+      # predicate is held to its arity like any condition given several
+      # values; a one-element Array is just its element. Blank elements, such
+      # as the empty string a check box group posts alongside its choices, are
+      # dropped when blank values are ignored. Date and time types keep the
+      # Array, which their cast builds one value from.
+      def spread_array_values!
+        return unless predicate && values.any? { |v| v.value.is_a?(Array) }
+        # An incomplete or unsearchable attribute has no type to look up;
+        # valid? discards the condition instead.
+        return unless predicate.type || attributes.first&.valid?
+        return if Value::ARRAY_CAST_TYPES.include?(default_type&.to_sym)
+
+        @values = values.flat_map do |v|
+          next [v] unless v.value.is_a?(Array)
+
+          elements = v.value
+          if Ransack.options[:ignore_blank_values]
+            elements = elements.reject { |e| e.blank? && e != false && !e.nil? }
+          end
+          elements.map { |e| Value.new(@context, e) }
+        end
+      end
+
+      def persisted?
+        false
+      end
+
+      def key
+        @key ||= attributes.map(&:name).join("_#{combinator}_") +
+          "_#{predicate.name}"
+      end
+
+      def eql?(other)
+        self.class == other.class &&
+        self.attributes == other.attributes &&
+        self.predicate == other.predicate &&
+        self.values == other.values &&
+        self.combinator == other.combinator
+      end
+      alias :== :eql?
+
+      def hash
+        [attributes, predicate, values, combinator].hash
+      end
+
+      def predicate_name=(name)
+        self.predicate = Predicate.named(scalar_param(name, 'a predicate'))
+        @predicate
+      end
+      alias :p= :predicate_name=
+
+      def predicate_name
+        predicate.name if predicate
+      end
+      alias :p :predicate_name
+
+      def validated_values
+        selected = values.select { |v| predicate.validator.call(v.value) }
+        return selected unless null_sentinel_requested?
+
+        # The sentinel is a marker to detect, never a value to search for
+        # or to cast to the column's type, so it is excluded from the
+        # values #format_predicate builds the ordinary IN/EQ node from.
+        selected.reject { |v| Constants.null_sentinel_value?(v.value, null_sentinel) }
+      end
+
+      def null_sentinel_requested?
+        Constants.null_sentinel_requested?(predicate.name, values, null_sentinel)
+      end
+
+      def casted_values_for_attribute(attr)
+        validated_values.map { |v| v.cast(predicate.type || attr.type) }
+      end
+
+      def formatted_values_for_attribute(attr)
+        formatted = casted_values_for_attribute(attr).map do |val|
+          if attr.ransacker && attr.ransacker.formatter
+            val = attr.ransacker.formatter.call(val)
+          end
+          val = predicate.format(val)
+          if val.is_a?(String) && val.include?('%')
+            val = Arel::Nodes::Quoted.new(val)
+          end
+          val
+        end
+        if predicate.wants_array
+          formatted
+        else
+          formatted.first
+        end
+      end
+
+      def arel_predicate_for_attribute(attr)
+        # `.arel_predicate === Proc` reads as a class check, but `Proc#===`
+        # is an alias for `#call`. It actually invokes the proc, passing
+        # the `Proc` class itself as the argument, and branches on whatever
+        # comes back. `#respond_to?(:call)` is a real check, and it also
+        # catches an object that defines `#call` but is neither a Proc nor
+        # a Method, which `=== Proc` treats as a method name.
+        if predicate.arel_predicate.respond_to?(:call)
+          values = casted_values_for_attribute(attr)
+          unless predicate.wants_array
+            values = values.first
+          end
+          predicate.arel_predicate.call(values)
+        else
+          predicate.arel_predicate
+        end
+      end
+
+      # The column (or ransacker expression) a predicate compares against.
+      # A case-insensitive predicate lowers it, unless the dialect has a
+      # case-insensitive LIKE of its own (ILIKE), in which case the lowering
+      # is left to the database. LOWER() is applied as a function rather than
+      # through Arel's Attribute#lower so that a ransacker returning any Arel
+      # node — a SQL literal, an infix operation — is lowered too (#1357).
+      def attr_value_for_attribute(attr)
+        if predicate.case_insensitive && !context.dialect.case_insensitive_like?
+          Arel::Nodes::NamedFunction.new('LOWER'.freeze, [attr.attr])
+        else
+          attr.attr
+        end
+      end
+
+      def default_type
+        predicate.type || (attributes.first && attributes.first.type)
+      end
+
+      def inspect
+        data = [
+          ['attributes'.freeze, a.try(:map, &:name)],
+          ['predicate'.freeze, p],
+          [Constants::COMBINATOR, m],
+          ['values'.freeze, v.try(:map, &:value)]
+        ]
+        .reject { |e| e[1].blank? }
+        .map { |v| "#{v[0]}: #{v[1]}" }
+        .join(', '.freeze)
+        "Condition <#{data}>"
+      end
+
+      def negative?
+        predicate.negative?
+      end
+
+      def arel_predicate
+        attributes.map { |attribute|
+          association = attribute.parent
+
+          predicate = if negative? && attribute.associated_collection? && not_nested_condition(attribute)
+            outer_key, query = context.correlated_subquery(association)
+            context.use_ancestors_of(association)
+
+            case self.predicate_name
+            when 'not_null'
+              if self.value
+                query.where(format_predicate(attribute))
+                Arel::Nodes::In.new(outer_key, Arel.sql(context.subquery_sql(query)))
+              else
+                query.where(format_predicate(attribute).not)
+                Arel::Nodes::NotIn.new(outer_key, Arel.sql(context.subquery_sql(query)))
+              end
+            when 'not_cont'
+              query.where(like_predicate(attribute, 'matches'.freeze))
+              Arel::Nodes::NotIn.new(outer_key, Arel.sql(context.subquery_sql(query)))
+            else
+              query.where(format_predicate(attribute).not)
+              Arel::Nodes::NotIn.new(outer_key, Arel.sql(context.subquery_sql(query)))
+            end
+          else
+            context.use_association(attribute.parent)
+            format_predicate(attribute)
+          end
+
+          predicate
+        }.reduce(combinator_method)
+      end
+
+      # Whether the attribute is on a collection the searched model has
+      # directly, rather than one nested under another association. A
+      # negative condition on a nested collection keeps its join (#1411).
+      # Told apart by the association's depth, not by its name: the name of
+      # an STI, scoped, aliased or through collection need not start with
+      # its table's (#1773). The table argument is no longer used, and is
+      # kept for callers of the 4.4.0 API.
+      def not_nested_condition(attribute, _parent_table = nil)
+        context.root_association?(attribute.parent)
+      end
+
+      private
+
+      def combinator_method
+        combinator === Constants::OR ? :or : :and
+      end
+
+      def format_predicate(attribute)
+        return format_predicate_from_node(attribute) if predicate.arel_node
+
+        arel_pred = arel_predicate_for_attribute(attribute)
+        arel_values = formatted_values_without_blank_for_non_string(attribute)
+
+        # A length predicate compares LENGTH(column) rather than the column.
+        attr_value = length_predicate? ? length_function_for_attribute(attribute) : attr_value_for_attribute(attribute)
+
+        if like_predicate?(arel_pred)
+          predicate = like_predicate(attribute, arel_pred, arel_values)
+        else
+          predicate = attr_value.public_send(arel_pred, arel_values)
+        end
+
+        if in_predicate?(predicate)
+          predicate.right = predicate.right.map do |pr|
+            casted_array?(pr) ? format_values_for(pr) : pr
+          end
+        end
+
+        predicate = null_sentinel_requested? ? apply_null_sentinel(predicate, attr_value) : predicate
+
+        # Replace an oversized Casted integer value with the plain integer,
+        # in order to avoid ActiveModel::RangeError from Arel::Node::Casted.
+        # The error can be ignored here because RDBMSs accept large numbers
+        # in condition clauses. Applied recursively rather than only to the
+        # top-level node, because the Casted value can sit inside an In /
+        # NotIn node's `right` Array, or inside the Grouping / And / Or
+        # that Arel's own `_any` / `_all` predicates build. Done here rather
+        # than in #arel_predicate because the negated collection branch there
+        # renders this node to SQL for its correlated subquery straight away,
+        # which is where the Casted value would raise. Runs last so it also
+        # covers the OR grouping the null sentinel may have added.
+        unwrap_oversized_integers(predicate)
+
+        predicate
+      end
+
+      # `validated_values` has already excluded the sentinel above, so
+      # `predicate` here is built from the real values alone (or, when
+      # the sentinel was the only value submitted, from an empty
+      # array). An empty IN or eq_any/in_any is not `IS NULL` on its
+      # own terms (an empty `IN` is a literal false, and an empty
+      # `eq_any` builds a broken Grouping), so that case is replaced
+      # outright rather than OR'd.
+      def apply_null_sentinel(predicate, attr_value)
+        if validated_values.empty?
+          attr_value.eq(nil)
+        else
+          predicate.or(attr_value.eq(nil))
+        end
+      end
+
+      def in_predicate?(predicate)
+        return unless defined?(Arel::Nodes::Casted)
+        predicate.class == Arel::Nodes::In || predicate.class == Arel::Nodes::NotIn
+      end
+
+      # The `present` / `blank` predicate formatters produce `[nil, '']` regardless
+      # of column type. The empty-string half has no meaning on non-string columns:
+      # ActiveRecord casts `''` to NULL for those types, producing the
+      # always-UNKNOWN `column != NULL` (or `column = NULL`) clause. Strip the
+      # empty string when the attribute is not a string-like column.
+      def formatted_values_without_blank_for_non_string(attribute)
+        arel_values = formatted_values_for_attribute(attribute)
+
+        if arel_values.is_a?(Array) && arel_values.include?(''.freeze) && !string_like_attribute?(attribute)
+          arel_values = arel_values.reject { |v| v == ''.freeze }
+        end
+
+        arel_values
+      end
+
+      # `arel_node` receives the attribute node and the already cast and
+      # formatted values, and returns a finished Arel node directly,
+      # instead of naming a method `#format_predicate` sends to
+      # `attr_value` with one argument.
+      def format_predicate_from_node(attribute)
+        attr_value = attr_value_for_attribute(attribute)
+        # A sentinel-only search has no real values, so the builder gets no
+        # input and the condition is `IS NULL` alone.
+        return attr_value.eq(nil) if null_sentinel_requested? && validated_values.empty?
+
+        values = formatted_values_without_blank_for_non_string(attribute)
+        predicate = self.predicate.arel_node.call(attr_value, values)
+
+        # A nil result would drop the condition and a String would reach the
+        # SQL as raw text, both without an error.
+        unless predicate.is_a?(Arel::Nodes::Node)
+          raise ArgumentError,
+            "arel_node for '#{self.predicate.name}' must return an Arel node, " \
+            "got #{predicate.class}"
+        end
+
+        if in_predicate?(predicate) && predicate.right.is_a?(Array)
+          predicate.right = predicate.right.map do |pr|
+            casted_array?(pr) ? format_values_for(pr) : pr
+          end
+        end
+
+        predicate = null_sentinel_requested? ? apply_null_sentinel(predicate, attr_value) : predicate
+
+        unwrap_oversized_integers(predicate)
+
+        predicate
+      end
+
+      LIKE_PREDICATES = %w[
+        matches matches_any matches_all
+        does_not_match does_not_match_any does_not_match_all
+      ].freeze
+
+      def like_predicate?(arel_predicate)
+        LIKE_PREDICATES.include?(arel_predicate)
+      end
+
+      # Builds a LIKE / NOT LIKE node (or the _any / _all forms).
+      #
+      # The value is wrapped in Arel::Nodes.build_quoted so that Active
+      # Record's `normalizes` cannot rewrite the wildcards, and the escape
+      # character is passed so the escaping done by `escape_wildcards` is
+      # honoured: without an explicit ESCAPE clause SQLite treats a backslash
+      # as a literal character (#1581). The compound forms iterate over an
+      # Array of patterns, so each element is quoted on its own.
+      #
+      # Only the `i_` predicates ask for a case-insensitive match. Arel's
+      # PostgreSQL visitor renders a case-sensitive `matches` as LIKE and the
+      # other kind as ILIKE; before 6.0 the flag was never passed and every
+      # LIKE on PostgreSQL became ILIKE (#1421).
+      def like_predicate(attribute, arel_predicate, values = formatted_values_for_attribute(attribute))
+        attr_value = attr_value_for_attribute(attribute)
+        escape = Constants::LIKE_ESCAPE_CHARACTER
+        case_sensitive = !predicate.case_insensitive
+
+        case arel_predicate
+        # Arel's does_not_match_any / _all take no case_sensitive argument,
+        # unlike the other four, so they are assembled here the same way Arel
+        # assembles them.
+        when 'does_not_match_any'.freeze
+          nodes = values.map { |v| attr_value.does_not_match(Arel::Nodes.build_quoted(v), escape, case_sensitive) }
+          Arel::Nodes::Grouping.new(nodes.inject(&:or))
+        when 'does_not_match_all'.freeze
+          nodes = values.map { |v| attr_value.does_not_match(Arel::Nodes.build_quoted(v), escape, case_sensitive) }
+          Arel::Nodes::Grouping.new(Arel::Nodes::And.new(nodes))
+        else
+          quoted = if values.is_a?(Array)
+            values.map { |v| Arel::Nodes.build_quoted(v) }
+          else
+            Arel::Nodes.build_quoted(values)
+          end
+          attr_value.public_send(arel_predicate, quoted, escape, case_sensitive)
+        end
+      end
+
+      STRING_LIKE_TYPES = %i[string text citext].freeze
+
+      def string_like_attribute?(attribute)
+        type = attribute.type
+        # Treat unknown types as string-like (conservative: keep the existing
+        # empty-string comparison rather than silently dropping it).
+        type.nil? || STRING_LIKE_TYPES.include?(type.to_sym)
+      end
+
+      def casted_array?(predicate)
+        predicate.is_a?(Arel::Nodes::Casted) && predicate.value.is_a?(Array)
+      end
+
+      def format_values_for(predicate)
+        predicate.value.map do |val|
+          val.is_a?(String) ? Arel::Nodes.build_quoted(val) : val
+        end
+      end
+
+      # Walks a predicate node for the shapes `#arel_predicate` or an
+      # `arel_node` builder can produce (a single Binary, an In/NotIn
+      # holding an Array, a Between, or several of these combined with
+      # Grouping/Not/And/Or) and replaces each integer Casted value it
+      # finds with the plain integer, in place.
+      def unwrap_oversized_integers(node)
+        case node
+        when Arel::Nodes::Grouping, Arel::Nodes::Not
+          unwrap_oversized_integers(node.expr)
+        when Arel::Nodes::And, Arel::Nodes::Or
+          # Both are Nary: `grouping_any` (behind every `_any` predicate)
+          # builds a single Or with one child per value, not a pairwise
+          # chain, so `left`/`right` alone would miss the third value on.
+          # A BETWEEN keeps its two bounds as Casted children of an And.
+          node.children.map! { |child| plain_integer(child) || child }
+          node.children.each { |child| unwrap_oversized_integers(child) }
+        when Arel::Nodes::In, Arel::Nodes::NotIn
+          if node.right.is_a?(Array)
+            node.right = node.right.map { |v| plain_integer(v) || v }
+          else
+            # In / NotIn are Binary subclasses and match before that arm, so a
+            # bare Casted right (not an Array) needs the same handling as one.
+            unwrap_binary_right(node)
+          end
+        when Arel::Nodes::Binary
+          unwrap_binary_right(node)
+          unwrap_oversized_integers(node.right) if node.right.is_a?(Arel::Nodes::And)
+        end
+      end
+
+      def unwrap_binary_right(node)
+        plain_value = plain_integer(node.right)
+        node.right = plain_value if plain_value
+      end
+
+      def plain_integer(arel_node)
+        return nil unless arel_node.is_a?(Arel::Nodes::Casted)
+
+        relation, name = arel_node.attribute.values
+        attribute_type = relation.type_for_attribute(name).type
+        return nil unless attribute_type == :integer && arel_node.value.is_a?(Integer)
+
+        arel_node.value
+      end
+
+      def length_predicate?
+        predicate_name.to_s.start_with?('length_')
+      end
+
+      def length_function_for_attribute(attribute)
+        Arel::Nodes::NamedFunction.new(
+          context.dialect.length_function,
+          [attr_value_for_attribute(attribute)]
+        )
+      end
+
+      def valid_combinator?
+        attributes.size < 2 || Constants::AND_OR.include?(combinator)
+      end
+    end
+  end
+end

@@ -1,0 +1,30 @@
+name: Test deploy to GitHub Pages
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-deploy:
+    name: Test deploy to GitHub Pages
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          working-directory: docs
+          bundler-cache: true
+
+      - name: Test build website
+        run: bundle exec jekyll build --strict_front_matter
+        working-directory: docs
+
+      - name: Check links
+        run: bundle exec htmlproofer _site --disable-external --no-enforce-https --swap-urls '^/ransack/:/'
+        working-directory: docs

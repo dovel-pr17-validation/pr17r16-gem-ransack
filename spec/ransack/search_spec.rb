@@ -1,0 +1,1702 @@
+require 'spec_helper'
+
+module Ransack
+  describe Search do
+    describe '#initialize' do
+      it 'removes empty conditions before building' do
+        expect_any_instance_of(Search).to receive(:build).with({})
+        Search.new(Person, name_eq: '')
+      end
+
+      it 'keeps conditions with a false value before building' do
+        expect_any_instance_of(Search).to receive(:build)
+        .with({ 'name_eq' => false })
+        Search.new(Person, name_eq: false)
+      end
+
+      it 'keeps conditions with a value before building' do
+        expect_any_instance_of(Search).to receive(:build)
+        .with({ 'name_eq' => 'foobar' })
+        Search.new(Person, name_eq: 'foobar')
+      end
+
+      context 'blank value handling' do
+        after { Ransack.configure { |c| c.ignore_blank_values = true } }
+
+        context 'when ignore_blank_values is true (the default)' do
+          it 'removes empty string conditions before building' do
+            expect_any_instance_of(Search).to receive(:build).with({})
+            Search.new(Person, name_eq: '')
+          end
+
+          it 'removes empty array conditions before building' do
+            expect_any_instance_of(Search).to receive(:build).with({})
+            Search.new(Person, name_in: [])
+          end
+
+          it 'removes conditions that are blank after whitespace stripping' do
+            expect_any_instance_of(Search).to receive(:build).with({})
+            Search.new(Person, name_eq: '   ')
+          end
+
+          it 'keeps false wrapped in a c: value envelope' do
+            s = Search.new(Person,
+              c: { '0' => { a: ['awesome'], p: 'eq', v: [{ value: false }] } }
+            )
+            expect(s.base.conditions.flat_map(&:values).map(&:value)).to eq [false]
+            field = "#{quote_table_name('people')}.#{quote_column_name('awesome')}"
+            expect(s.result.to_sql).to include "#{field} = "
+          end
+
+          it 'removes nil wrapped in a c: value envelope' do
+            s = Search.new(Person,
+              c: { '0' => { a: ['awesome'], p: 'eq', v: [{ value: nil }] } }
+            )
+            expect(s.base.conditions).to be_empty
+          end
+        end
+
+        context 'when ignore_blank_values is false' do
+          before { Ransack.configure { |c| c.ignore_blank_values = false } }
+
+          it 'keeps empty string conditions before building' do
+            expect_any_instance_of(Search).to receive(:build)
+            .with({ 'name_eq' => '' })
+            Search.new(Person, name_eq: '')
+          end
+
+          it 'keeps empty array conditions before building' do
+            expect_any_instance_of(Search).to receive(:build)
+            .with({ 'name_in' => [] })
+            Search.new(Person, name_in: [])
+          end
+
+          it 'still removes nil conditions before building' do
+            expect_any_instance_of(Search).to receive(:build).with({})
+            Search.new(Person, name_eq: nil)
+          end
+
+          # The envelope hash can carry a symbol or a string key; `false` was
+          # lost under the symbol key alone (#1736).
+          [{ value: false }, { 'value' => false }].each do |envelope|
+            it "keeps false wrapped as #{envelope.inspect} in a c: condition" do
+              s = Search.new(Person,
+                c: { '0' => { a: ['awesome'], p: 'eq', v: [envelope] } }
+              )
+              expect(s.base.conditions.flat_map(&:values).map(&:value)).to eq [false]
+              field = "#{quote_table_name('people')}.#{quote_column_name('awesome')}"
+              expect(s.result.to_sql).to include "#{field} = "
+            end
+          end
+
+          it 'still removes nil wrapped in a c: value envelope' do
+            s = Search.new(Person,
+              c: { '0' => { a: ['awesome'], p: 'eq', v: [{ value: nil }] } }
+            )
+            expect(s.base.conditions).to be_empty
+          end
+
+          it 'searches for the empty string with an eq predicate' do
+            s = Search.new(Person, name_eq: '')
+            field = "#{quote_table_name('people')}.#{quote_column_name('name')}"
+            expect(s.result.to_sql).to include "#{field} = ''"
+          end
+
+          it 'matches nothing for an empty array with an in predicate' do
+            s = Search.new(Person, name_in: [])
+            expect(s.result.to_a).to eq []
+          end
+
+          # A blank on a non-string column would be cast to nil before
+          # validation and the condition silently dropped — returning every
+          # row, which is the one outcome this option exists to prevent.
+          it 'treats a blank on an integer column as NULL' do
+            s = Search.new(Person, parent_id_eq: '')
+            field = "#{quote_table_name('people')}.#{quote_column_name('parent_id')}"
+            expect(s.result.to_sql).to include "#{field} IS NULL"
+          end
+
+          it 'treats a blank on a boolean column as NULL' do
+            s = Search.new(Person, awesome_eq: '')
+            field = "#{quote_table_name('people')}.#{quote_column_name('awesome')}"
+            expect(s.result.to_sql).to include "#{field} IS NULL"
+          end
+
+          it 'matches nothing for a blank inside an in predicate on an integer column' do
+            Person.create!(salary: 100)
+            expect(Search.new(Person, salary_in: ['']).result.to_a).to eq []
+          end
+
+          it 'matches nothing for a blank with a comparison predicate on an integer column' do
+            Person.create!(salary: 100)
+            expect(Search.new(Person, salary_gt: '').result.to_a).to eq []
+          end
+
+          it 'keeps the condition on the search object' do
+            s = Search.new(Person, children_name_eq: '')
+            condition = s.base[:children_name_eq]
+            expect(condition).not_to be_nil
+            expect(condition.values.first.value).to eq ''
+          end
+        end
+      end
+
+      context 'whitespace stripping' do
+        context 'when whitespace_strip option is true' do
+          before do
+            Ransack.configure { |c| c.strip_whitespace = true }
+          end
+
+          it 'strips leading & trailing whitespace before building' do
+            expect_any_instance_of(Search).to receive(:build)
+            .with({ 'name_eq' => 'foobar' })
+            Search.new(Person, name_eq: '   foobar     ')
+          end
+
+          describe 'nested search params with group conditions' do
+            it 'strips leading & trailing whitespace in all nested values before building' do
+              expect_any_instance_of(Search).to receive(:build)
+              .with({ 'g' => [{ 'm' => 'or', 'name_eq' => 'foobar' }] })
+              Search.new(Person, { g: [{ m: 'or', name_eq: '   foobar     ' }] })
+            end
+          end
+        end
+
+        context 'when whitespace_strip option is false' do
+          before do
+            Ransack.configure { |c| c.strip_whitespace = false }
+          end
+
+          it 'doesn\'t strip leading & trailing whitespace before building' do
+            expect_any_instance_of(Search).to receive(:build)
+            .with({ 'name_eq' => '   foobar     ' })
+            Search.new(Person, name_eq: '   foobar     ')
+          end
+        end
+
+        it 'strips leading & trailing whitespace when strip_whitespace search parameter is true' do
+          expect_any_instance_of(Search).to receive(:build)
+          .with({ 'name_eq' => 'foobar' })
+          Search.new(Person, { name_eq: '   foobar     ' }, { strip_whitespace: true })
+        end
+
+        it 'doesn\'t strip leading & trailing whitespace when strip_whitespace search parameter is false' do
+          expect_any_instance_of(Search).to receive(:build)
+          .with({ 'name_eq' => '   foobar     ' })
+          Search.new(Person, { name_eq: '   foobar     ' }, { strip_whitespace: false })
+        end
+      end
+
+      context 'a per-search null_sentinel override' do
+        let(:sentinel) { '__ransack_null__' }
+        let(:null_col) { "#{quote_table_name('people')}.#{quote_column_name('name')} IS NULL" }
+
+        after { Ransack.configure { |c| c.null_sentinel = nil } }
+
+        it 'applies when no global null_sentinel is configured' do
+          search = Search.new(Person, { name_in: ['Aaron', sentinel] }, { null_sentinel: sentinel })
+          expect(search.result.to_sql).to include(null_col)
+        end
+
+        it 'turns the feature off for one search, with false, while the global setting stays on' do
+          Ransack.configure { |c| c.null_sentinel = sentinel }
+          search = Search.new(Person, { name_in: ['Aaron', sentinel] }, { null_sentinel: false })
+          expect(search.result.to_sql).not_to include('IS NULL')
+        end
+
+        # A Context can be reused by several searches (see the shared-context
+        # specs in active_record/context_spec). Each condition captures the
+        # override when it is built, so the later search's setting (here,
+        # none) does not rewrite the earlier search's SQL.
+        it 'is kept by an earlier search when a later one reuses its context' do
+          context = Context.for(Person)
+          first = Search.new(Person, { name_in: ['Aaron', sentinel] }, { context: context, null_sentinel: sentinel })
+          Search.new(Person, { name_in: ['Aaron'] }, { context: context })
+          expect(first.result.to_sql).to include(null_col)
+        end
+      end
+
+      it 'removes empty suffixed conditions before building' do
+        expect_any_instance_of(Search).to receive(:build).with({})
+        Search.new(Person, name_eq_any: [''])
+      end
+
+      it 'keeps suffixed conditions with a false value before building' do
+        expect_any_instance_of(Search).to receive(:build)
+        .with({ 'name_eq_any' => [false] })
+        Search.new(Person, name_eq_any: [false])
+      end
+
+      it 'keeps suffixed conditions with a value before building' do
+        expect_any_instance_of(Search).to receive(:build)
+        .with({ 'name_eq_any' => ['foobar'] })
+        Search.new(Person, name_eq_any: ['foobar'])
+      end
+
+      it 'keeps conditions with a nil value in an array before building' do
+        expect_any_instance_of(Search).to receive(:build)
+        .with({ 'name_in' => [nil] })
+        Search.new(Person, name_in: [nil])
+      end
+
+      it 'does not raise exception for string :params argument' do
+        expect { Search.new(Person, '') }.not_to raise_error
+      end
+
+      it 'accepts a context option' do
+        shared_context = Context.for(Person)
+        s1 = Search.new(Person, { name_eq: 'A' }, context: shared_context)
+        s2 = Search.new(Person, { name_eq: 'B' }, context: shared_context)
+        expect(s1.context).to be s2.context
+      end
+    end
+
+    describe '#build' do
+      it 'creates conditions for top-level attributes' do
+        s = Search.new(Person, name_eq: 'Ernie')
+        condition = s.base[:name_eq]
+        expect(condition).to be_a Nodes::Condition
+        expect(condition.predicate.name).to eq 'eq'
+        expect(condition.attributes.first.name).to eq 'name'
+        expect(condition.value).to eq 'Ernie'
+      end
+
+      it 'creates conditions for association attributes' do
+        s = Search.new(Person, children_name_eq: 'Ernie')
+        condition = s.base[:children_name_eq]
+        expect(condition).to be_a Nodes::Condition
+        expect(condition.predicate.name).to eq 'eq'
+        expect(condition.attributes.first.name).to eq 'children_name'
+        expect(condition.value).to eq 'Ernie'
+      end
+
+      # The type in an `_of_Model_type` suffix comes from the query string, so
+      # it can name anything. A name that is not a searchable model makes the
+      # key invalid, as an unknown attribute is, rather than raising from the
+      # constant lookup (#1738).
+      context 'with a polymorphic type that is not a searchable model' do
+        after { Ransack.configure { |c| c.ignore_unknown_conditions = true } }
+
+        {
+          'an unknown constant' => 'notable_of_NoSuchType_type_name_eq',
+          'an unknown namespaced constant' => 'notable_of_Nope::Model_type_name_eq',
+          'a lowercase name' => 'notable_of_person_type_name_eq',
+          'a class that is not a model' => 'notable_of_String_type_name_eq',
+          'a module' => 'notable_of_Comparable_type_name_eq',
+          'an abstract model' => 'notable_of_ApplicationRecord_type_name_eq',
+          'ActiveRecord::Base itself' => 'notable_of_ActiveRecord::Base_type_name_eq',
+          'a namespace that is not a module' => 'notable_of_ENV::Person_type_name_eq'
+        }.each do |label, key|
+          it "ignores a condition on #{label} by default" do
+            s = Search.new(Note, key => 'Ernie')
+            expect(s.base.conditions).to be_empty
+            expect { s.result.to_a }.not_to raise_error
+          end
+
+          it "raises InvalidSearchError for a condition on #{label} in a strict search" do
+            Ransack.configure { |c| c.ignore_unknown_conditions = false }
+            expect { Search.new(Note, key => 'Ernie') }
+              .to raise_error(InvalidSearchError, /#{Regexp.escape(key)}/)
+          end
+        end
+
+        {
+          'an unknown type' => 'NoSuchType',
+          'a namespace that is not a module' => 'ENV::Person'
+        }.each do |label, type|
+          it "drops a sort on #{label} by default" do
+            s = Search.new(Note, s: "notable_of_#{type}_type_name asc")
+            expect(s.result.to_sql).not_to include('ORDER BY')
+            expect { s.result.to_a }.not_to raise_error
+          end
+
+          it "raises InvalidSearchError for a sort on #{label} in a strict search" do
+            Ransack.configure { |c| c.ignore_unknown_conditions = false }
+            expect { Search.new(Note, s: "notable_of_#{type}_type_name asc") }
+              .to raise_error(InvalidSearchError)
+          end
+        end
+
+        it 'still searches a known type' do
+          s = Search.new(Note, notable_of_Person_type_name_eq: 'Ernie')
+          expect(s.result.to_sql).to include quote_table_name('people')
+        end
+      end
+
+      it 'creates conditions for polymorphic belongs_to association attributes' do
+        s = Search.new(Note, notable_of_Person_type_name_eq: 'Ernie')
+        condition = s.base[:notable_of_Person_type_name_eq]
+        expect(condition).to be_a Nodes::Condition
+        expect(condition.predicate.name).to eq 'eq'
+        expect(condition.attributes.first.name)
+          .to eq 'notable_of_Person_type_name'
+        expect(condition.value).to eq 'Ernie'
+      end
+
+      it 'creates conditions for multiple polymorphic belongs_to association
+        attributes' do
+        s = Search.new(Note,
+          notable_of_Person_type_name_or_notable_of_Article_type_title_eq: 'Ernie')
+        condition = s.
+          base[:notable_of_Person_type_name_or_notable_of_Article_type_title_eq]
+        expect(condition).to be_a Nodes::Condition
+        expect(condition.predicate.name).to eq 'eq'
+        expect(condition.attributes.first.name)
+          .to eq 'notable_of_Person_type_name'
+        expect(condition.attributes.last.name)
+          .to eq 'notable_of_Article_type_title'
+        expect(condition.value).to eq 'Ernie'
+      end
+
+      it 'creates conditions for aliased attributes' do
+        s = Search.new(Person, full_name_eq: 'Ernie')
+        condition = s.base[:full_name_eq]
+        expect(condition).to be_a Nodes::Condition
+        expect(condition.predicate.name).to eq 'eq'
+        expect(condition.attributes.first.name).to eq 'full_name'
+        expect(condition.value).to eq 'Ernie'
+      end
+
+      it 'preserves default scope and conditions for associations' do
+        s = Search.new(Person, published_articles_title_eq: 'Test')
+        expect(s.result.to_sql).to include 'default_scope'
+        expect(s.result.to_sql).to include 'published'
+      end
+
+      # The failure/oversight in Ransack::Nodes::Condition#arel_predicate or deeper is beyond my understanding of the structures
+      it 'preserves (inverts) default scope and conditions for negative subqueries' do
+        # the positive case (published_articles_title_eq) is
+        # SELECT "people".* FROM "people"
+        # LEFT OUTER JOIN "articles" ON "articles"."person_id" = "people"."id"
+        #   AND "articles"."published" = 't'
+        #   AND ('default_scope' = 'default_scope')
+        # WHERE "articles"."title" = 'Test' ORDER BY "people"."id" DESC
+        #
+        # negative case was
+        # SELECT "people".* FROM "people" WHERE "people"."id" NOT IN (
+        #   SELECT "articles"."person_id" FROM "articles"
+        #   WHERE "articles"."person_id" = "people"."id"
+        #     AND NOT ("articles"."title" != 'Test')
+        # ) ORDER BY "people"."id" DESC
+        #
+        # Should have been like
+        # SELECT "people".* FROM "people" WHERE "people"."id" NOT IN (
+        #   SELECT "articles"."person_id" FROM "articles"
+        #   WHERE "articles"."person_id" = "people"."id"
+        #     AND "articles"."title" = 'Test' AND "articles"."published" = 't' AND ('default_scope' = 'default_scope')
+        # ) ORDER BY "people"."id" DESC
+        #
+        # With tenanting (eg default_scope with column reference), NOT IN should be like
+        # SELECT "people".* FROM "people" WHERE "people"."tenant_id" = 'tenant_id' AND "people"."id" NOT IN (
+        #   SELECT "articles"."person_id" FROM "articles"
+        #   WHERE "articles"."person_id" = "people"."id"
+        #     AND "articles"."tenant_id" = 'tenant_id'
+        #     AND "articles"."title" = 'Test' AND "articles"."published" = 't' AND ('default_scope' = 'default_scope')
+        # ) ORDER BY "people"."id" DESC
+
+        # #1773: the scope has to be inside the subquery. Checking only that
+        # `published` appeared passed for a LEFT OUTER JOIN with a
+        # row-level `!=` too, which is what the search fell back to.
+        s = Search.new(Person, published_articles_title_not_eq: 'Test')
+        outer, subquery = s.result.to_sql.split('NOT IN (SELECT', 2)
+        expect(subquery).not_to be_nil
+        expect(outer).not_to include 'JOIN'
+        expect(subquery).to include "#{quote_table_name('articles')}.#{quote_column_name('published')} = "
+        expect(subquery).to include "('default_scope' = 'default_scope')"
+        expect(subquery).to include "#{quote_table_name('articles')}.#{quote_column_name('title')} != 'Test'"
+      end
+
+      it 'discards empty conditions' do
+        s = Search.new(Person, children_name_eq: '')
+        condition = s.base[:children_name_eq]
+        expect(condition).to be_nil
+      end
+
+      it 'accepts base grouping condition as an option' do
+        expect(Nodes::Grouping).to receive(:new).with(kind_of(Context), 'or')
+        Search.new(Person, {}, { grouping: 'or' })
+      end
+
+      it 'accepts arrays of groupings' do
+        s = Search.new(Person,
+          g: [
+            { m: 'or', name_eq: 'Ernie', children_name_eq: 'Ernie' },
+            { m: 'or', name_eq: 'Bert', children_name_eq: 'Bert' },
+          ]
+        )
+        ors = s.groupings
+        expect(ors.size).to eq(2)
+        or1, or2 = ors
+        expect(or1).to be_a Nodes::Grouping
+        expect(or1.combinator).to eq 'or'
+        expect(or2).to be_a Nodes::Grouping
+        expect(or2.combinator).to eq 'or'
+      end
+
+      it 'accepts nested arrays of longhand :groupings' do
+        s = Search.new(Person,
+          groupings: [
+            { 
+              m: 'or', 
+              name_eq: 'Ernie', 
+              children_name_eq: 'Ernie',
+              groupings: [
+                { m: 'and', name_eq: 'Bert' },
+                { m: 'and', children_name_eq: 'Bert' }
+              ]
+            },
+          ]
+        )
+        ors = s.groupings
+        expect(ors.size).to eq(1)
+        or1 = ors.first
+        expect(or1).to be_a Nodes::Grouping
+        expect(or1.combinator).to eq 'or'
+        expect(or1.groupings.size).to eq(2)
+      end
+
+      it 'accepts attributes hashes for groupings' do
+        s = Search.new(Person,
+          g: {
+            '0' => { m: 'or', name_eq: 'Ernie', children_name_eq: 'Ernie' },
+            '1' => { m: 'or', name_eq: 'Bert',  children_name_eq: 'Bert' },
+          }
+        )
+        ors = s.groupings
+        expect(ors.size).to eq(2)
+        or1, or2 = ors
+        expect(or1).to be_a Nodes::Grouping
+        expect(or1.combinator).to eq 'or'
+        expect(or2).to be_a Nodes::Grouping
+        expect(or2.combinator).to eq 'or'
+      end
+
+      it 'accepts attributes hashes for conditions' do
+        s = Search.new(Person,
+          c: {
+            '0' => { a: ['name'], p: 'eq', v: ['Ernie'] },
+            '1' => {
+                     a: ['children_name', 'parent_name'],
+                     p: 'eq', v: ['Ernie'], m: 'or'
+                   }
+          }
+        )
+        conditions = s.base.conditions
+        expect(conditions.size).to eq(2)
+        expect(conditions.map { |c| c.class })
+        .to eq [Nodes::Condition, Nodes::Condition]
+      end
+
+      # Regression test for https://github.com/activerecord-hackery/ransack/issues/1150
+      # The low-level `c:` API previously only worked when `a:` and `v:` were given
+      # in their Hash form (`{"0" => {name: ...}}`). When supplied as Arrays of
+      # attribute / value envelopes (`[{name: ...}]`, `[{value: ...}]`) the parser
+      # silently dropped the attribute or treated the entire envelope hash as the
+      # value.
+      context 'low-level c: API with Array of envelope hashes' do
+        it 'extracts :name from each attribute hash inside an Array' do
+          s = Search.new(Person,
+            c: [{ a: [{ name: 'name' }], p: 'cont', v: [{ value: 'Ernie' }] }]
+          )
+          field = "#{quote_table_name('people')}.#{quote_column_name('name')}"
+          expect(s.result.to_sql).to match(/#{field} I?LIKE '%Ernie%'/)
+        end
+
+        it 'extracts :value from each value hash inside an Array' do
+          s = Search.new(Person,
+            c: [{ a: { '0' => { name: 'name' } }, p: 'cont', v: [{ value: 'Ernie' }] }]
+          )
+          field = "#{quote_table_name('people')}.#{quote_column_name('name')}"
+          expect(s.result.to_sql).to match(/#{field} I?LIKE '%Ernie%'/)
+        end
+
+        it 'still accepts plain Array of names/values (canonical form)' do
+          s = Search.new(Person,
+            c: [{ a: ['name'], p: 'cont', v: ['Ernie'] }]
+          )
+          field = "#{quote_table_name('people')}.#{quote_column_name('name')}"
+          expect(s.result.to_sql).to match(/#{field} I?LIKE '%Ernie%'/)
+        end
+      end
+
+      it 'creates conditions for custom predicates that take arrays' do
+        Ransack.configure do |config|
+          config.add_predicate 'ary_pred', wants_array: true
+        end
+
+        s = Search.new(Person, name_ary_pred: ['Ernie', 'Bert'])
+        condition = s.base[:name_ary_pred]
+        expect(condition).to be_a Nodes::Condition
+        expect(condition.predicate.name).to eq 'ary_pred'
+        expect(condition.attributes.first.name).to eq 'name'
+        expect(condition.value).to eq ['Ernie', 'Bert']
+      end
+
+      it 'does not evaluate the query on #inspect' do
+        s = Search.new(Person, children_id_in: [1, 2, 3])
+        expect(s.inspect).not_to match /ActiveRecord/
+      end
+
+      context 'with an invalid condition' do
+        subject { Search.new(Person, unknown_attr_eq: 'Ernie') }
+
+        context 'when ignore_unknown_conditions configuration option is false' do
+          before do
+            Ransack.configure { |c| c.ignore_unknown_conditions = false }
+          end
+
+          specify { expect { subject }.to raise_error ArgumentError }
+          specify { expect { subject }.to raise_error InvalidSearchError }
+        end
+
+        context 'when ignore_unknown_conditions configuration option is true' do
+          before do
+            Ransack.configure { |c| c.ignore_unknown_conditions = true }
+          end
+
+          specify { expect { subject }.not_to raise_error }
+        end
+
+        subject(:with_ignore_unknown_conditions_false) {
+          Search.new(Person,
+            { unknown_attr_eq: 'Ernie' },
+            { ignore_unknown_conditions: false }
+          )
+        }
+
+        subject(:with_ignore_unknown_conditions_true) {
+          Search.new(Person,
+            { unknown_attr_eq: 'Ernie' },
+            { ignore_unknown_conditions: true }
+          )
+        }
+
+        context 'when ignore_unknown_conditions search parameter is absent' do
+          specify { expect { subject }.not_to raise_error }
+        end
+
+        context 'when ignore_unknown_conditions search parameter is false' do
+          specify { expect { with_ignore_unknown_conditions_false }.to raise_error ArgumentError }
+          specify { expect { with_ignore_unknown_conditions_false }.to raise_error InvalidSearchError }
+        end
+
+        context 'when ignore_unknown_conditions search parameter is true' do
+          specify { expect { with_ignore_unknown_conditions_true }.not_to raise_error }
+        end
+      end
+
+      # `alias :m= :combinator=` used to be declared before the normalising
+      # writer existed, so it bound to the plain attribute writer and `m:`
+      # skipped normalisation entirely — `g: [{ m: 'OR' }]` silently became AND.
+      context 'with a combinator that needs normalising' do
+        ['or', 'OR', 'Or', :or, :OR].each do |combinator|
+          it "treats #{combinator.inspect} as 'or'" do
+            search = Search.new(
+              Person, g: [{ m: combinator, name_eq: 'a', email_eq: 'b' }]
+            )
+
+            expect(search.result.to_sql).to include ' OR '
+          end
+        end
+
+        ['and', 'AND', :and].each do |combinator|
+          it "treats #{combinator.inspect} as 'and'" do
+            search = Search.new(
+              Person, g: [{ m: combinator, name_eq: 'a', email_eq: 'b' }]
+            )
+
+            expect(search.result.to_sql).to include ' AND '
+          end
+        end
+      end
+
+      context 'a single-value predicate given several values' do
+        let(:params) do
+          { c: [{ a: ['name'], p: 'eq', v: [{ value: 'Aric' }, { value: 'Fern' }] }] }
+        end
+
+        it 'raises in strict mode, naming the predicate and attribute' do
+          expect { Search.new(Person, params, ignore_unknown_conditions: false) }
+            .to raise_error(InvalidSearchError, 'Predicate eq takes a single value, 2 given for name')
+        end
+
+        it 'raises for a nested grouping in strict mode' do
+          expect { Search.new(Person, { g: [params] }, ignore_unknown_conditions: false) }
+            .to raise_error(InvalidSearchError)
+        end
+
+        it 'drops the condition in the default lenient mode' do
+          search = Search.new(Person, params)
+          expect(search.base.conditions).to be_empty
+          expect(search.result.to_sql).not_to include('name')
+        end
+
+        it 'drops a condition with an unknown predicate instead of an arity error' do
+          search = Search.new(Person, { c: [{ a: ['name'], p: 'nope', v: [{ value: 'a' }, { value: 'b' }] }] },
+            ignore_unknown_conditions: false)
+          expect(search.base.conditions).to be_empty
+        end
+
+        it 'drops a condition with an unknown attribute instead of an arity error' do
+          search = Search.new(Person, { c: [{ a: ['nope'], p: 'eq', v: [{ value: 'a' }, { value: 'b' }] }] },
+            ignore_unknown_conditions: false)
+          expect(search.base.conditions).to be_empty
+        end
+
+        it 'accepts several values for a predicate that wants an array' do
+          search = Search.new(Person, { c: [{ a: ['name'], p: 'in', v: [{ value: 'Aric' }, { value: 'Fern' }] }] },
+            ignore_unknown_conditions: false)
+          expect(search.result.to_sql).to include('IN')
+        end
+
+        context 'when one of the extra values is the configured null_sentinel' do
+          let(:sentinel) { '__ransack_null__' }
+          let(:params) do
+            { c: [{ a: ['name'], p: 'eq', v: [{ value: 'Aric' }, { value: sentinel }] }] }
+          end
+
+          before { Ransack.configure { |c| c.null_sentinel = sentinel } }
+          after { Ransack.configure { |c| c.null_sentinel = nil } }
+
+          it 'still raises in strict mode, rather than being absorbed by the sentinel bypass' do
+            expect { Search.new(Person, params, ignore_unknown_conditions: false) }
+              .to raise_error(InvalidSearchError, 'Predicate eq takes a single value, 2 given for name')
+          end
+
+          it 'still drops the condition in the default lenient mode' do
+            search = Search.new(Person, params)
+            expect(search.base.conditions).to be_empty
+          end
+        end
+      end
+
+      # #1772: a group of check boxes posts `q[name_eq][]=a&q[name_eq][]=b`.
+      # The short form compared the column with the Array's string form, or
+      # cast it to nil on a typed column and dropped it without a word.
+      context 'a single-value predicate given an Array in the short form' do
+        it 'drops the condition in the default lenient mode' do
+          search = Search.new(Person, name_eq: ['Sleep', 'Use'])
+          expect(search.base.conditions).to be_empty
+          expect(search.result.to_sql).not_to include('Sleep')
+        end
+
+        it 'raises in strict mode, naming the predicate and attribute' do
+          expect { Search.new(Person, { name_eq: ['Sleep', 'Use'] }, ignore_unknown_conditions: false) }
+            .to raise_error(InvalidSearchError, 'Predicate eq takes a single value, 2 given for name')
+          expect { Person.ransack!(salary_eq: [1, 2]) }
+            .to raise_error(InvalidSearchError, 'Predicate eq takes a single value, 2 given for salary')
+        end
+
+        # #1216
+        it 'searches a one-element Array as its element' do
+          expect(Search.new(Person, name_eq: ['x']).result.to_sql)
+            .to include("#{quote_table_name('people')}.#{quote_column_name('name')} = 'x'")
+          expect(Search.new(Person, doubled_name_gteq: ['36']).result.to_sql)
+            .to match(/>= '36'/)
+        end
+
+        it 'ignores the blank value a check box group posts with its choices' do
+          expect(Search.new(Person, name_eq: ['', 'Sleep']).result.to_sql).to include("= 'Sleep'")
+        end
+
+        it 'keeps the Array a multiparameter date is collapsed into' do
+          search = Search.new(Person, 'created_at_gteq(1i)' => '2020', 'created_at_gteq(2i)' => '3',
+            'created_at_gteq(3i)' => '4')
+          expect(search.base.conditions.size).to eq 1
+          expect(search.result.to_sql).to include('2020-03-04')
+        end
+      end
+
+      # #1771: an Array inside one value envelope of the c: API was cast as a
+      # single value, so it matched every row or a stringified Array.
+      context 'an Array inside one value envelope' do
+        def params(attribute, predicate, value)
+          { c: { '0' => { a: { '0' => { name: attribute } }, p: predicate, v: { '0' => { value: value } } } } }
+        end
+
+        it 'is spread into one value per element for a predicate that wants an array' do
+          ids = Person.order(:id).limit(2).pluck(:id)
+          expect(Search.new(Person, params('id', 'in', ids)).result.pluck(:id)).to match_array ids
+          expect(Person.ransack!(params('id', 'in', ids)).result.pluck(:id)).to match_array ids
+          expect(Search.new(Person, params('name', 'in', %w[a b])).result.to_sql).to match(/IN \('a', 'b'\)/)
+          expect(Search.new(Person, params('name', 'not_eq_all', %w[a b])).result.to_sql)
+            .to match(/!= 'a' AND .*!= 'b'/)
+        end
+
+        it 'is dropped for a single-value predicate in the default lenient mode' do
+          search = Search.new(Person, params('name', 'eq', %w[a b]))
+          expect(search.base.conditions).to be_empty
+        end
+
+        it 'raises for a single-value predicate in strict mode' do
+          expect { Search.new(Person, params('name', 'eq', %w[a b]), ignore_unknown_conditions: false) }
+            .to raise_error(InvalidSearchError, 'Predicate eq takes a single value, 2 given for name')
+        end
+
+        it 'searches a one-element Array as its element for a single-value predicate' do
+          expect(Search.new(Person, params('name', 'eq', ['x'])).result.to_sql).to include("= 'x'")
+        end
+
+        it 'discards the condition when its attribute has no name' do
+          search = Search.new(Person, c: { '0' => { a: { '0' => {} }, p: 'in', v: { '0' => { value: [1, 2] } } } })
+          expect(search.base.conditions).to be_empty
+          expect(search.result.to_sql).not_to include('WHERE')
+        end
+      end
+
+      context 'combinator validation in strict mode' do
+        it 'accepts any spelling of a valid combinator' do
+          expect { Search.new(Person, { combinator: 'OR', name_eq: 'a' }, ignore_unknown_conditions: false) }
+            .not_to raise_error
+        end
+
+        it 'rejects an unknown combinator given as m' do
+          expect { Search.new(Person, { m: 'nand', name_eq: 'a' }, ignore_unknown_conditions: false) }
+            .to raise_error(InvalidSearchError, 'Invalid combinator nand')
+        end
+
+        it 'rejects an unknown combinator inside a nested grouping' do
+          expect {
+            Search.new(Person, { g: [{ m: 'nand', name_eq: 'a', email_eq: 'b' }] }, ignore_unknown_conditions: false)
+          }.to raise_error(InvalidSearchError, 'Invalid combinator nand')
+        end
+
+        it 'ignores a blank combinator, as a submitted empty field' do
+          expect { Search.new(Person, { m: '', name_eq: 'a' }, ignore_unknown_conditions: false) }
+            .not_to raise_error
+        end
+      end
+
+      context 'combinator validation in permissive mode' do
+        it 'falls back to and for an unknown combinator' do
+          search = Search.new(Person, g: [{ m: 'nand', name_eq: 'a', email_eq: 'b' }])
+          expect(search.result.to_sql).to include ' AND '
+        end
+
+        it 'does not raise for a non-string combinator' do
+          search = Search.new(Person, g: [{ m: 1, name_eq: 'a', email_eq: 'b' }])
+          expect(search.result.to_sql).to include ' AND '
+        end
+      end
+
+      context 'long-form condition keys' do
+        it 'accepts attributes, predicate and values in a condition' do
+          search = Search.new(Person, c: [{ attributes: ['name'], predicate: 'eq', values: ['Ernie'] }])
+          field = "#{quote_table_name('people')}.#{quote_column_name('name')}"
+          expect(search.result.to_sql).to include "#{field} = 'Ernie'"
+        end
+      end
+
+      context 'with an invalid combinator' do
+        subject { Search.new(Person, name_eq: 'foobar', combinator: 'unknown') }
+
+        context 'when ignore_unknown_conditions configuration option is false' do
+          before do
+            Ransack.configure { |c| c.ignore_unknown_conditions = false }
+          end
+
+          specify { expect { subject }.to raise_error ArgumentError }
+        end
+
+        context 'when ignore_unknown_conditions configuration option is true' do
+          before do
+            Ransack.configure { |c| c.ignore_unknown_conditions = true }
+          end
+
+          specify { expect { subject }.not_to raise_error }
+        end
+
+        subject(:with_ignore_unknown_conditions_false) {
+          Search.new(Person,
+            { name_eq: 'foobar', combinator: 'unknown' },
+            { ignore_unknown_conditions: false }
+          )
+        }
+
+        subject(:with_ignore_unknown_conditions_true) {
+          Search.new(Person,
+            { name_eq: 'foobar', combinator: 'unknown' },
+            { ignore_unknown_conditions: true }
+          )
+        }
+
+        context 'when ignore_unknown_conditions search parameter is absent' do
+          specify { expect { subject }.not_to raise_error }
+        end
+
+        context 'when ignore_unknown_conditions search parameter is false' do
+          specify { expect { with_ignore_unknown_conditions_false }.to raise_error ArgumentError }
+        end
+
+        context 'when ignore_unknown_conditions search parameter is true' do
+          specify { expect { with_ignore_unknown_conditions_true }.not_to raise_error }
+        end
+      end
+
+      it 'does not modify the parameters' do
+        params = { name_eq: '' }
+        expect { Search.new(Person, params) }.not_to change { params }
+      end
+
+      context 'with empty search parameters' do
+        it 'handles completely empty parameters' do
+          search = Search.new(Person, {})
+          expect(search.result.to_sql).not_to match(/WHERE/)
+        end
+
+        it 'handles nil parameters' do
+          search = Search.new(Person, nil)
+          expect(search.result.to_sql).not_to match(/WHERE/)
+        end
+      end
+
+      context 'with whitespace-only values' do
+        before do
+          Ransack.configure { |c| c.strip_whitespace = true }
+        end
+
+        it 'removes whitespace-only values' do
+          expect_any_instance_of(Search).to receive(:build).with({})
+          Search.new(Person, name_eq: '   ')
+        end
+
+        it 'keeps values with content after whitespace stripping' do
+          expect_any_instance_of(Search).to receive(:build).with({ 'name_eq' => 'test' })
+          Search.new(Person, name_eq: '  test  ')
+        end
+      end
+
+      context 'with special characters in values' do
+        it 'handles values with special regex characters' do
+          search = Search.new(Person, name_cont: 'test[(){}^$|?*+.\\')
+          expect { search.result }.not_to raise_error
+        end
+
+        it 'handles values with SQL injection attempts' do
+          search = Search.new(Person, name_cont: "'; DROP TABLE people; --")
+          expect { search.result }.not_to raise_error
+        end
+      end
+
+      context "ransackable_scope" do
+        around(:each) do |example|
+          Person.define_singleton_method(:name_eq) do |name|
+            self.where(name: name)
+          end
+
+          begin
+            example.run
+          ensure
+            Person.singleton_class.undef_method :name_eq
+          end
+        end
+
+        it "is prioritized over base predicates" do
+          allow(Person).to receive(:ransackable_scopes)
+            .and_return(Person.ransackable_scopes + [:name_eq])
+
+          s = Search.new(Person, name_eq: "Johny")
+          expect(s.instance_variable_get(:@scope_args)["name_eq"]).to eq("Johny")
+          expect(s.base[:name_eq]).to be_nil
+        end
+      end
+
+      context "ransackable_scope with array arguments" do
+        around(:each) do |example|
+          Person.define_singleton_method(:domestic) do |countries|
+            self.where(name: countries)
+          end
+
+          Person.define_singleton_method(:flexible_scope) do |*args|
+            self.where(id: args)
+          end
+
+          Person.define_singleton_method(:two_param_scope) do |param1, param2|
+            self.where(name: param1, id: param2)
+          end
+
+          begin
+            example.run
+          ensure
+            Person.singleton_class.undef_method :domestic
+            Person.singleton_class.undef_method :flexible_scope
+            Person.singleton_class.undef_method :two_param_scope
+          end
+        end
+
+        it "handles scopes that take arrays as single arguments (arity 1)" do
+          allow(Person).to receive(:ransackable_scopes)
+            .and_return(Person.ransackable_scopes + [:domestic])
+
+          # This should not raise ArgumentError
+          expect {
+            s = Search.new(Person, domestic: ['US', 'JP'])
+            s.result # This triggers the actual scope call
+          }.not_to raise_error
+
+          s = Search.new(Person, domestic: ['US', 'JP'])
+          expect(s.instance_variable_get(:@scope_args)["domestic"]).to eq("US")
+        end
+
+        it "handles scopes with flexible arity (negative arity)" do
+          allow(Person).to receive(:ransackable_scopes)
+            .and_return(Person.ransackable_scopes + [:flexible_scope])
+
+          expect {
+            s = Search.new(Person, flexible_scope: ['US', 'JP'])
+            s.result
+          }.not_to raise_error
+        end
+
+        it "handles scopes with arity > 1" do
+          allow(Person).to receive(:ransackable_scopes)
+            .and_return(Person.ransackable_scopes + [:two_param_scope])
+
+          expect {
+            s = Search.new(Person, two_param_scope: ['param1', 'param2'])
+            s.result
+          }.not_to raise_error
+        end
+
+        it "still supports the workaround with nested arrays" do
+          allow(Person).to receive(:ransackable_scopes)
+            .and_return(Person.ransackable_scopes + [:domestic])
+
+          # The workaround from the issue should still work
+          expect {
+            s = Search.new(Person, domestic: [['US', 'JP']])
+            s.result
+          }.not_to raise_error
+        end
+      end
+
+      # Regression test for https://github.com/activerecord-hackery/ransack/issues/1339
+      # Scopes nested inside groupings (`g: [...]`) were silently dropped
+      # rather than applied to the query.
+      context "ransackable_scope inside groupings" do
+        before do
+          allow(Person).to receive(:ransackable_scopes)
+            .and_return(Person.ransackable_scopes + [:over_age])
+        end
+
+        it "applies the scope when it is the only key inside a grouping" do
+          s = Search.new(Person, g: [{ over_age: 18 }])
+          expect(s.result.to_sql).to match(/age > '?18'?/)
+        end
+
+        it "applies the scope alongside other conditions in the same grouping" do
+          s = Search.new(Person, g: [{ name_eq: 'Aaron', over_age: 18 }])
+          sql = s.result.to_sql
+          expect(sql).to match(/age > '?18'?/)
+          expect(sql).to match(/name.* = 'Aaron'/)
+        end
+      end
+    end
+
+    describe '#collapse_multiparameter_attributes!' do
+      def collapse(attrs)
+        Search.allocate.send(:collapse_multiparameter_attributes!, attrs)
+      end
+
+      it 'collapses legitimate multiparameter attributes' do
+        result = collapse(
+          'created_at(1i)' => '2021',
+          'created_at(2i)' => '1',
+          'created_at(3i)' => '5'
+        )
+        expect(result['created_at']).to eq [2021, 1, 5]
+      end
+
+      it 'drops a position larger than the allowed number of components' do
+        result = collapse('created_at(100000000000i)' => '1')
+        expect(result).not_to have_key('created_at')
+      end
+
+      it 'drops a zero or negative position' do
+        result = collapse('created_at(0i)' => '1', 'created_at(-1i)' => '1')
+        expect(result).not_to have_key('created_at')
+      end
+
+      it 'drops a key with no position' do
+        result = collapse('created_at(' => '1', 'created_at()' => '2')
+        expect(result).to eq({})
+        expect {
+          Person.ransack('created_at(' => '1').result.to_sql
+        }.not_to raise_error
+      end
+
+      it 'keeps a plain value and drops the fragments given alongside it' do
+        result = collapse('created_at' => '2020', 'created_at(1i)' => '2021')
+        expect(result).to eq('created_at' => '2020')
+        expect {
+          Person.ransack('created_at' => '2020', 'created_at(1i)' => '2021').result.to_sql
+        }.not_to raise_error
+      end
+
+      it 'keeps the position at the upper boundary and drops just past it' do
+        at_limit = collapse('created_at(16i)' => '1')
+        expect(at_limit['created_at'].length).to eq 16
+
+        past_limit = collapse('created_at(17i)' => '1')
+        expect(past_limit).not_to have_key('created_at')
+      end
+
+      it 'does not raise or exhaust memory for a crafted huge position (DoS)' do
+        expect {
+          Person.ransack('created_at(100000000000i)' => '1').result.to_sql
+        }.not_to raise_error
+      end
+
+      context 'when the position has no cast suffix (e.g. (10000) not (10000i))' do
+        it 'stores a small uncast position as its raw value' do
+          result = collapse('created_at(1)' => 'x')
+          expect(result['created_at']).to eq ['x']
+        end
+
+        it 'drops a large uncast position' do
+          result = collapse('created_at(10000)' => '1')
+          expect(result).not_to have_key('created_at')
+        end
+
+        it 'does not raise or exhaust memory for a crafted huge uncast position (DoS)' do
+          expect {
+            Person.ransack('created_at(100000000000)' => '1').result.to_sql
+          }.not_to raise_error
+        end
+      end
+    end
+
+    describe '#result' do
+      let(:people_name_field) {
+        "#{quote_table_name("people")}.#{quote_column_name("name")}"
+      }
+      let(:children_people_name_field) {
+        "#{quote_table_name("children_people")}.#{quote_column_name("name")}"
+      }
+      let(:notable_type_field) {
+        "#{quote_table_name("notes")}.#{quote_column_name("notable_type")}"
+      }
+      let(:people_temperament_field) {
+        "#{quote_table_name("people")}.#{quote_column_name("temperament")}"
+      }
+
+      context 'when evaluating enums' do
+        before do
+          Person.first.update_attribute(:temperament, 'choleric')
+        end
+
+        it 'evaluates enum key correctly' do
+          s = Search.new(Person, temperament_eq: 'choleric')
+
+          expect(s.result.to_sql).not_to match(/#{people_temperament_field} = 0/)
+          expect(s.result.to_sql).to match(/#{people_temperament_field} = #{Person.temperaments[:choleric]}/)
+          expect(s.result).not_to be_empty
+        end
+
+        it 'evaluates enum value correctly' do
+          s = Search.new(Person, temperament_eq: Person.temperaments[:choleric])
+
+          expect(s.result.to_sql).not_to match(/#{people_temperament_field} = 0/)
+          expect(s.result.to_sql).to match(/#{people_temperament_field} = #{Person.temperaments[:choleric]}/)
+          expect(s.result).not_to be_empty
+        end
+      end
+
+      # Regression test for https://github.com/activerecord-hackery/ransack/issues/1644
+      context 'when enum fix does not break boolean predicate casting' do
+        it 'casts 0 to false for not_null predicate' do
+          s = Search.new(Person, name_not_null: 0)
+          expect(s.result.to_sql).to match(/#{people_name_field} IS NULL/)
+        end
+
+        it 'casts 1 to true for not_null predicate' do
+          s = Search.new(Person, name_not_null: 1)
+          expect(s.result.to_sql).to match(/#{people_name_field} IS NOT NULL/)
+        end
+
+        it 'casts "false" to false for not_null predicate' do
+          s = Search.new(Person, name_not_null: 'false')
+          expect(s.result.to_sql).to match(/#{people_name_field} IS NULL/)
+        end
+      end
+
+      it 'evaluates conditions contextually' do
+        s = Search.new(Person, children_name_eq: 'Ernie')
+        expect(s.result).to be_an ::ActiveRecord::Relation
+        expect(s.result.to_sql).to match /#{
+          children_people_name_field} = 'Ernie'/
+      end
+
+      it 'use appropriate table alias' do
+        s = Search.new(Person, {
+          name_eq: "person_name_query",
+          articles_title_eq: "person_article_title_query",
+          parent_name_eq: "parent_name_query",
+          parent_articles_title_eq: 'parents_article_title_query'
+        }).result
+
+        real_query = remove_quotes_and_backticks(s.to_sql)
+
+        expect(real_query)
+                .to match(%r{LEFT OUTER JOIN articles ON (\('default_scope' = 'default_scope'\) AND )?articles.person_id = people.id})
+        # Rails 8.1+ / Arel 10+ use "AS" for join table aliases (e.g. "articles AS articles_people")
+        expect(real_query)
+                .to match(%r{LEFT OUTER JOIN articles(\s+AS)?\s+articles_people ON (\('default_scope' = 'default_scope'\) AND )?articles_people.person_id = parents_people.id})
+
+        expect(real_query)
+          .to include "people.name = 'person_name_query'"
+        expect(real_query)
+          .to include "articles.title = 'person_article_title_query'"
+        expect(real_query)
+          .to include "parents_people.name = 'parent_name_query'"
+        expect(real_query)
+          .to include "articles_people.title = 'parents_article_title_query'"
+      end
+
+      it 'evaluates conditions for multiple `belongs_to` associations to the same table contextually' do
+        s = Search.new(
+          Recommendation,
+          person_name_eq: 'Ernie',
+          target_person_parent_name_eq: 'Test'
+        ).result
+        expect(s).to be_an ::ActiveRecord::Relation
+        real_query = remove_quotes_and_backticks(s.to_sql)
+        expected_query = <<-SQL
+          SELECT recommendations.* FROM recommendations
+          LEFT OUTER JOIN people ON people.id = recommendations.person_id
+          LEFT OUTER JOIN people target_people_recommendations
+            ON target_people_recommendations.id = recommendations.target_person_id
+          LEFT OUTER JOIN people parents_people
+            ON parents_people.id = target_people_recommendations.parent_id
+          WHERE (people.name = 'Ernie' AND parents_people.name = 'Test')
+        SQL
+        .squish
+        # Normalize JOIN alias format: Rails 8.1+ / Arel 10+ output "AS" (e.g. "people AS parents_people")
+        normalize_join_aliases = ->(sql) { sql.gsub(/\s+AS\s+/, ' ') }
+        expect(normalize_join_aliases.call(real_query)).to eq normalize_join_aliases.call(expected_query)
+      end
+
+      # #1775: a table joined both directly and through another association.
+      # With the nested association searched first, the direct one was taken
+      # to be the nested join, so its join was never added and its condition
+      # was bound to the nested join's table.
+      describe 'a direct and a nested association to the same table' do
+        around do |example|
+          ::ActiveRecord::Base.transaction do
+            example.run
+            raise ::ActiveRecord::Rollback
+          end
+        end
+
+        let(:author)  { Person.create!(name: 'issue-1775-author') }
+        let(:article) { Article.create!(person: author, title: 'issue-1775-article') }
+
+        it 'binds each condition to its own join, in either param order' do
+          comment = Comment.create!(article: article, person: Person.create!(name: 'issue-1775-commenter'), body: 'issue-1775')
+          params = { article_person_name_eq: author.name, person_name_eq: 'issue-1775-commenter' }
+
+          [params, params.to_a.reverse.to_h].each do |ordered|
+            expect(Comment.ransack(ordered).result.to_a).to eq [comment]
+          end
+        end
+
+        it 'binds each condition to its own join from the other side too' do
+          Comment.create!(article: article, person: Person.create!(name: 'issue-1775-commenter'), body: 'issue-1775')
+          params = { comments_person_name_eq: 'issue-1775-commenter', person_name_eq: author.name }
+
+          [params, params.to_a.reverse.to_h].each do |ordered|
+            expect(Article.ransack(ordered).result.to_a).to eq [article]
+          end
+        end
+
+        it 'sorts on the direct association after a condition on the nested one' do
+          later = Comment.create!(article: article, person: Person.create!(name: 'issue-1775-z'), body: 'issue-1775')
+          sooner = Comment.create!(article: article, person: Person.create!(name: 'issue-1775-a'), body: 'issue-1775')
+
+          result = Comment.ransack(article_person_name_eq: author.name, s: 'person_name asc').result
+          expect(result.to_a).to eq [sooner, later]
+        end
+      end
+
+      it 'evaluates compound conditions contextually' do
+        s = Search.new(Person, children_name_or_name_eq: 'Ernie').result
+        expect(s).to be_an ::ActiveRecord::Relation
+        expect(s.to_sql).to match /#{children_people_name_field
+          } = 'Ernie' OR #{people_name_field} = 'Ernie'/
+      end
+
+      it 'evaluates polymorphic belongs_to association conditions contextually' do
+        s = Search.new(Note, notable_of_Person_type_name_eq: 'Ernie').result
+        expect(s).to be_an ::ActiveRecord::Relation
+        expect(s.to_sql).to match /#{people_name_field} = 'Ernie'/
+        expect(s.to_sql).to match /#{notable_type_field} = 'Person'/
+      end
+
+      it 'evaluates nested conditions' do
+        s = Search.new(Person, children_name_eq: 'Ernie',
+          g: [
+            { m: 'or', name_eq: 'Ernie', children_children_name_eq: 'Ernie' }
+          ]
+        ).result
+        expect(s).to be_an ::ActiveRecord::Relation
+        first, last = s.to_sql.split(/ AND /)
+        expect(first).to match /#{children_people_name_field} = 'Ernie'/
+        expect(last).to match /#{
+          people_name_field} = 'Ernie' OR #{
+          quote_table_name("children_people_2")}.#{
+          quote_column_name("name")} = 'Ernie'/
+      end
+
+      it 'evaluates arrays of groupings' do
+        s = Search.new(Person,
+          g: [
+            { m: 'or', name_eq: 'Ernie', children_name_eq: 'Ernie' },
+            { m: 'or', name_eq: 'Bert', children_name_eq: 'Bert' }
+          ]
+        ).result
+        expect(s).to be_an ::ActiveRecord::Relation
+        first, last = s.to_sql.split(/ AND /)
+        expect(first).to match /#{people_name_field} = 'Ernie' OR #{
+          children_people_name_field} = 'Ernie'/
+        expect(last).to match /#{people_name_field} = 'Bert' OR #{
+          children_people_name_field} = 'Bert'/
+      end
+
+      it 'returns distinct records when passed distinct: true' do
+        s = Search.new(Person,
+          g: [
+            { m: 'or', comments_body_cont: 'e', articles_comments_body_cont: 'e' }
+          ]
+        )
+
+        all_or_load, uniq_or_distinct = :load, :distinct
+        expect(s.result.send(all_or_load).size)
+        .to eq(8998)
+        expect(s.result(distinct: true).size)
+        .to eq(10)
+        expect(s.result.send(all_or_load).send(uniq_or_distinct))
+        .to eq s.result(distinct: true).send(all_or_load)
+      end
+
+      it 'evaluates joins with belongs_to join' do
+        s = Person.joins(:parent).ransack(parent_name_eq: 'Ernie').result(distinct: true)
+        expect(s).to be_an ::ActiveRecord::Relation
+      end
+
+      private
+
+        def remove_quotes_and_backticks(str)
+          str.gsub(/["`]/, '')
+        end
+    end
+
+    describe 'a condition name with both _and_ and _or_' do
+      # There is no precedence grammar for a name using both combinators; the
+      # first one found used to be applied to every attribute (#1019).
+      it 'raises under a strict search' do
+        expect { Person.ransack!(name_or_email_and_only_search_eq: 'x') }
+          .to raise_error(InvalidSearchError, /Mixed combinators in name_or_email_and_only_search/)
+        expect { Person.ransack({ name_and_email_or_only_search_eq: 'x' }, ignore_unknown_conditions: false) }
+          .to raise_error(InvalidSearchError, /Mixed combinators/)
+      end
+
+      it 'keeps the first combinator under a permissive search' do
+        sql = Person.ransack(name_or_email_and_only_search_eq: 'x').result.to_sql
+        expect(sql).to include(%q{= 'x' OR })
+        expect(sql).not_to include(' AND ')
+      end
+
+      it 'accepts a single combinator repeated' do
+        expect { Person.ransack!(name_or_email_or_only_search_eq: 'x') }.not_to raise_error
+        expect { Person.ransack!(name_and_email_eq: 'x') }.not_to raise_error
+      end
+
+      # An attribute whose own name contains both is never split.
+      it 'leaves an attribute named with both combinators alone' do
+        allow(Person).to receive(:ransackable_attributes).and_return(Person.authorizable_ransackable_attributes + ['stop_and_or_end'])
+        Person.ransacker(:stop_and_or_end) { |parent| parent.table[:stop_end] }
+
+        expect { Person.ransack!(stop_and_or_end_eq: 'x') }.not_to raise_error
+        expect(Person.ransack!(stop_and_or_end_eq: 'x').result.to_sql).to include('= \'x\'')
+      ensure
+        Person._ransackers.delete('stop_and_or_end')
+      end
+    end
+
+    describe 'an association path listed in ransackable_attributes' do
+      # #1774: `person_name` on Article's allowlist was taken for a column
+      # of articles and bound as `articles.person_name`, which does not
+      # exist. Only a real attribute is bound on the model itself; any other
+      # name is followed through the association as usual (#756).
+      around do |example|
+        ::ActiveRecord::Base.transaction do
+          example.run
+          raise ::ActiveRecord::Rollback
+        end
+      end
+
+      before do
+        allow(Article).to receive(:ransackable_attributes).and_return(%w[title person_name orderId])
+      end
+
+      let!(:ernie) { Article.create!(person: Person.create!(name: 'issue-1774-ernie'), title: 'one') }
+      let!(:bert)  { Article.create!(person: Person.create!(name: 'issue-1774-bert'), title: 'two') }
+      let(:scope) { Article.where(id: [ernie.id, bert.id]) }
+
+      it 'searches through the association' do
+        expect(scope.ransack(person_name_cont: 'issue-1774-ernie').result.to_a).to eq [ernie]
+      end
+
+      it 'sorts through the association' do
+        expect(scope.ransack(s: 'person_name desc').result.to_a).to eq [ernie, bert]
+        expect(scope.ransack(s: 'person_name asc').result.to_a).to eq [bert, ernie]
+      end
+
+      it 'rejects a listed name that is neither an attribute nor a path' do
+        expect { Article.ransack!(orderId_eq: 'x') }
+          .to raise_error(InvalidSearchError, /Invalid search term orderId_eq/)
+      end
+    end
+
+    describe 'a scope that shares a column name' do
+      # Search#build already preferred the scope; the writer and reader used
+      # by form builders went through method_missing, which did not (#1472).
+      let(:model) do
+        Class.new(Person) do
+          def self.name
+            'PersonWithSalaryScope'
+          end
+          scope :salary, ->(amount) { where('salary > ?', amount) }
+          def self.ransackable_scopes(_auth_object = nil)
+            %i[salary]
+          end
+        end
+      end
+
+      it 'is applied through the writer as well as the params hash' do
+        # MySQL renders a bound integer as '100'.
+        expect(model.ransack(salary: 100).result.to_sql).to match(/salary > '?100'?/)
+
+        search = model.ransack
+        search.salary = 100
+        expect(search.result.to_sql).to match(/salary > '?100'?/)
+        expect(search.salary).to eq 100
+      end
+    end
+
+    describe 'the long-form condition keys' do
+      let(:attributes) { { '0' => { name: 'with_arguments', ransacker_args: [10, 100] } } }
+
+      it 'accept predicate: as the long spelling of p:' do
+        sql = Person.ransack(conditions: [{ attributes: attributes, predicate: 'cont', values: ['x'] }]).result.to_sql
+        expect(sql).to include('BETWEEN 10 AND 100')
+      end
+
+      # The spelling the ransackers page documented for years (#1009).
+      it 'accept predicate_name: too' do
+        sql = Person.ransack(conditions: [{ attributes: attributes, predicate_name: 'cont', values: ['x'] }]).result.to_sql
+        expect(sql).to include('BETWEEN 10 AND 100')
+      end
+    end
+
+    describe '#sorts=' do
+      before do
+        @s = Search.new(Person)
+      end
+
+      # A sort that is neither ransortable nor backed by a sort_by scope was
+      # dropped silently even under ransack! (#1427).
+      context 'under a strict search' do
+        it 'raises for an attribute that is not ransortable' do
+          expect { Person.ransack!(s: 'only_search asc') }
+            .to raise_error(InvalidSearchError, 'Invalid sort term only_search')
+          expect { Person.ransack({ s: 'only_search asc' }, ignore_unknown_conditions: false) }
+            .to raise_error(InvalidSearchError, 'Invalid sort term only_search')
+        end
+
+        it 'raises for an attribute that does not exist' do
+          expect { Person.ransack!(s: 'nonexistent_column asc') }
+            .to raise_error(InvalidSearchError, 'Invalid sort term nonexistent_column')
+        end
+
+        it 'accepts a sort backed by a sort_by_<name>_<dir> scope' do
+          s = Person.ransack!(s: 'reverse_name asc')
+          expect(s.result.to_sql).to include('REVERSE(name) ASC')
+        end
+
+        it 'accepts a sort given as a hash' do
+          expect { Person.ransack!(s: { '0' => { name: 'name', dir: 'asc' } }) }.not_to raise_error
+          expect { Person.ransack!(s: { '0' => { name: 'only_search', dir: 'asc' } }) }
+            .to raise_error(InvalidSearchError, 'Invalid sort term only_search')
+        end
+      end
+
+      it 'drops an unknown sort under a permissive search' do
+        s = Person.ransack(s: 'only_search asc')
+        expect(s.result.to_sql).not_to include('only_search')
+      end
+
+      # Each assignment used to append, so sorts could not be reset (#994).
+      it 'replaces the sorts on each assignment' do
+        @s.sorts = 'id asc'
+        @s.sorts = 'name asc'
+        expect(@s.sorts.map(&:name)).to eq ['name']
+
+        @s.sorts = []
+        expect(@s.sorts).to be_empty
+        expect(@s.result.to_sql).not_to include(quote_column_name('name'))
+
+        @s.sorts = ['id asc', 'name desc']
+        expect(@s.sorts.map(&:name)).to eq %w[id name]
+      end
+
+      it 'still adds with build_sort' do
+        @s.sorts = 'id asc'
+        @s.build_sort(name: 'name', dir: 'desc')
+        expect(@s.sorts.map(&:name)).to eq %w[id name]
+      end
+
+      it 'doesn\'t creates sorts' do
+        @s.sorts = ''
+        expect(@s.sorts.size).to eq(0)
+      end
+
+      it 'creates sorts based on a single attribute/direction' do
+        @s.sorts = 'id desc'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort.name).to eq 'id'
+        expect(sort.dir).to eq 'desc'
+      end
+
+      it 'creates sorts based on a single attribute and uppercase direction' do
+        @s.sorts = 'id DESC'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort.name).to eq 'id'
+        expect(sort.dir).to eq 'desc'
+      end
+
+      it 'creates sorts based on a single attribute and without direction' do
+        @s.sorts = 'id'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort.name).to eq 'id'
+        expect(sort.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on a single alias/direction' do
+        @s.sorts = 'daddy desc'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort.name).to eq 'parent_name'
+        expect(sort.dir).to eq 'desc'
+      end
+
+      it 'creates sorts based on a single alias and uppercase direction' do
+        @s.sorts = 'daddy DESC'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort.name).to eq 'parent_name'
+        expect(sort.dir).to eq 'desc'
+      end
+
+      it 'creates sorts based on a single alias and without direction' do
+        @s.sorts = 'daddy'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort.name).to eq 'parent_name'
+        expect(sort.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on attributes, alias and directions in array format' do
+        @s.sorts = ['id desc', { name: 'daddy', dir: 'asc' }]
+        expect(@s.sorts.size).to eq(2)
+        sort1, sort2 = @s.sorts
+        expect(sort1).to be_a Nodes::Sort
+        expect(sort1.name).to eq 'id'
+        expect(sort1.dir).to eq 'desc'
+        expect(sort2).to be_a Nodes::Sort
+        expect(sort2.name).to eq 'parent_name'
+        expect(sort2.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on attributes, alias and uppercase directions in array format' do
+        @s.sorts = ['id DESC', { name: 'daddy', dir: 'ASC' }]
+        expect(@s.sorts.size).to eq(2)
+        sort1, sort2 = @s.sorts
+        expect(sort1).to be_a Nodes::Sort
+        expect(sort1.name).to eq 'id'
+        expect(sort1.dir).to eq 'desc'
+        expect(sort2).to be_a Nodes::Sort
+        expect(sort2.name).to eq 'parent_name'
+        expect(sort2.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on attributes, alias and different directions
+        in array format' do
+        @s.sorts = ['id DESC', { name: 'daddy', dir: nil }]
+        expect(@s.sorts.size).to eq(2)
+        sort1, sort2 = @s.sorts
+        expect(sort1).to be_a Nodes::Sort
+        expect(sort1.name).to eq 'id'
+        expect(sort1.dir).to eq 'desc'
+        expect(sort2).to be_a Nodes::Sort
+        expect(sort2.name).to eq 'parent_name'
+        expect(sort2.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on attributes, alias and directions in hash format' do
+        @s.sorts = {
+          '0' => { name: 'id', dir: 'desc' },
+          '1' => { name: 'daddy', dir: 'asc' }
+        }
+        expect(@s.sorts.size).to eq(2)
+        expect(@s.sorts).to be_all { |s| Nodes::Sort === s }
+        id_sort = @s.sorts.detect { |s| s.name == 'id' }
+        daddy_sort = @s.sorts.detect { |s| s.name == 'parent_name' }
+        expect(id_sort.dir).to eq 'desc'
+        expect(daddy_sort.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on attributes, alias and uppercase directions
+        in hash format' do
+        @s.sorts = {
+          '0' => { name: 'id', dir: 'DESC' },
+          '1' => { name: 'daddy', dir: 'ASC' }
+        }
+        expect(@s.sorts.size).to eq(2)
+        expect(@s.sorts).to be_all { |s| Nodes::Sort === s }
+        id_sort = @s.sorts.detect { |s| s.name == 'id' }
+        daddy_sort = @s.sorts.detect { |s| s.name == 'parent_name' }
+        expect(id_sort.dir).to eq 'desc'
+        expect(daddy_sort.dir).to eq 'asc'
+      end
+
+      it 'creates sorts based on attributes, alias and different directions
+        in hash format' do
+        @s.sorts = {
+          '0' => { name: 'id', dir: 'DESC' },
+          '1' => { name: 'daddy', dir: nil }
+        }
+        expect(@s.sorts.size).to eq(2)
+        expect(@s.sorts).to be_all { |s| Nodes::Sort === s }
+        id_sort = @s.sorts.detect { |s| s.name == 'id' }
+        daddy_sort = @s.sorts.detect { |s| s.name == 'parent_name' }
+        expect(id_sort.dir).to eq 'desc'
+        expect(daddy_sort.dir).to eq 'asc'
+      end
+
+      it 'overrides existing sort' do
+        @s.sorts = 'id asc'
+        expect(@s.result.first.id).to eq 1
+      end
+
+      it 'creates valid sort when ransortable_attributes returns symbols (issue #1538)' do
+        allow(Person).to receive(:ransortable_attributes).and_return([:id, :name])
+
+        @s.sorts = 'name asc'
+        expect(@s.sorts.size).to eq(1)
+        sort = @s.sorts.first
+        expect(sort).to be_a Nodes::Sort
+        expect(sort).to be_valid
+        expect(@s.result.to_sql).to include('ORDER BY')
+        expect(@s.result.to_sql).to include('name')
+      end
+
+      it 'raises ArgumentError when an invalid argument is sent' do
+        expect do
+          @s.sorts = 1234
+        end.to raise_error(ArgumentError,  "Invalid argument (Integer) supplied to sorts=")
+      end
+
+      it 'raises InvalidSearchError when an invalid argument is sent' do
+        expect do
+          @s.sorts = 1234
+        end.to raise_error(Ransack::InvalidSearchError,  "Invalid argument (Integer) supplied to sorts=")
+      end
+
+      it "fields sort option", if: !RansackHelper.dialect.mysql? do
+        default = Ransack.options.clone
+
+        s = Search.new(Person, s: 'name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" ASC"
+
+        Ransack.configure { |c| c.fields_sort_option = :nulls_first }
+        s = Search.new(Person, s: 'name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" ASC NULLS FIRST"
+        s = Search.new(Person, s: 'name desc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" DESC NULLS LAST"
+
+        Ransack.configure { |c| c.fields_sort_option = :nulls_last }
+        s = Search.new(Person, s: 'name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" ASC NULLS LAST"
+        s = Search.new(Person, s: 'name desc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" DESC NULLS FIRST"
+
+        Ransack.options = default
+      end
+
+      it "fields sort option with double name", if: !RansackHelper.dialect.mysql? do
+        default = Ransack.options.clone
+
+        s = Search.new(Person, s: 'doubled_name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" ASC"
+
+        Ransack.configure { |c| c.fields_sort_option = :nulls_first }
+        s = Search.new(Person, s: 'doubled_name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" ASC NULLS FIRST"
+        s = Search.new(Person, s: 'doubled_name desc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" DESC NULLS LAST"
+
+        Ransack.configure { |c| c.fields_sort_option = :nulls_last }
+        s = Search.new(Person, s: 'doubled_name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" ASC NULLS LAST"
+        s = Search.new(Person, s: 'doubled_name desc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" DESC NULLS FIRST"
+
+        Ransack.configure { |c| c.fields_sort_option = :nulls_always_first }
+        s = Search.new(Person, s: 'doubled_name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" ASC NULLS FIRST"
+        s = Search.new(Person, s: 'doubled_name desc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" DESC NULLS FIRST"
+
+        Ransack.configure { |c| c.fields_sort_option = :nulls_always_last }
+        s = Search.new(Person, s: 'doubled_name asc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" ASC NULLS LAST"
+        s = Search.new(Person, s: 'doubled_name desc')
+        expect(s.result.to_sql).to eq "SELECT \"people\".* FROM \"people\" ORDER BY \"people\".\"name\" || \"people\".\"name\" DESC NULLS LAST"
+
+        Ransack.options = default
+      end
+    end
+
+    describe '#method_missing' do
+      before do
+        @s = Search.new(Person)
+      end
+
+      it 'raises NoMethodError when sent an invalid attribute' do
+        expect { @s.blah }.to raise_error NoMethodError
+      end
+
+      it 'sets condition attributes when sent valid attributes' do
+        @s.name_eq = 'Ernie'
+        expect(@s.name_eq).to eq 'Ernie'
+      end
+
+      it 'allows chaining to access nested conditions' do
+        @s.groupings = [
+          { m: 'or', name_eq: 'Ernie', children_name_eq: 'Ernie' }
+        ]
+        expect(@s.groupings.first.children_name_eq).to eq 'Ernie'
+      end
+    end
+  end
+end

@@ -1,0 +1,239 @@
+module Ransack
+  module Nodes
+    class Grouping < Node
+      attr_reader :combinator
+
+      # The writer is inherited from Node, which normalises the value. Defining
+      # it here as well — or aliasing before the definition is in place — would
+      # bind `m=` to the plain attribute writer and skip that normalisation,
+      # which is how `g: [{ m: 'OR' }]` silently fell back to AND.
+      alias :m :combinator
+      alias :m= :combinator=
+
+      i18n_word :condition, :and, :or
+      i18n_alias c: :condition, n: :and, o: :or
+
+      delegate :each, to: :values
+
+      def initialize(context, combinator = nil)
+        super(context)
+        self.combinator = combinator if combinator
+      end
+
+      def persisted?
+        false
+      end
+
+      def translate(key, options = {})
+        super or Translate.attribute(
+          key.to_s, options.merge(context: context)
+        )
+      end
+
+      def conditions
+        @conditions ||= []
+      end
+      alias :c :conditions
+
+      def conditions=(conditions)
+        case conditions
+        when Array
+          conditions.each { |attrs| add_condition(attrs) }
+        when Hash
+          conditions.each_value { |attrs| add_condition(attrs) }
+        end
+        remove_duplicate_conditions!
+      end
+      alias :c= :conditions=
+
+      def [](key)
+        conditions.detect { |c| c.key == key.to_s }
+      end
+
+      def []=(key, value)
+        conditions.reject! { |c| c.key == key.to_s && c&.value == value&.value }
+        self.conditions << value
+      end
+
+      def values
+        conditions + groupings
+      end
+
+      def respond_to?(method_id)
+        super or begin
+          method_name = method_id.to_s
+          attribute_method?(method_name) ? true : false
+        end
+      end
+
+      def build_condition(opts = {})
+        new_condition(opts).tap do |condition|
+          self.conditions << condition
+        end
+      end
+
+      def new_condition(opts = {})
+        attrs = opts[:attributes] || 1
+        vals = opts[:values] || 1
+        condition = Condition.new(@context)
+        attrs.times { condition.build_attribute }
+        vals.times { condition.build_value }
+        condition
+      end
+
+      def groupings
+        @groupings ||= []
+      end
+      alias :g :groupings
+
+      def groupings=(groupings)
+        case groupings
+        when Array
+          groupings.each do |attrs|
+            grouping_object = new_grouping(attrs)
+            self.groupings << grouping_object if grouping_object.values.any?
+          end
+        when Hash
+          groupings.each do |index, attrs|
+            grouping_object = new_grouping(attrs)
+            self.groupings << grouping_object if grouping_object.values.any?
+          end
+        else
+          raise InvalidSearchError,
+            "Invalid argument (#{groupings.class}) supplied to groupings="
+        end
+      end
+      alias :g= :groupings=
+
+      def method_missing(method_id, *args)
+        method_name = method_id.to_s.dup
+        writer = method_name.sub!(/=\z/, ''.freeze)
+        if attribute_method?(method_name)
+          if writer
+            write_attribute(method_name, *args)
+          else
+            read_attribute(method_name)
+          end
+        else
+          super
+        end
+      end
+
+      def attribute_method?(name)
+        return false unless @context.key_within_depth_limit?(name)
+
+        stripped_name = @context.resolve_aliases(strip_predicate_and_index(name))
+        return true if @context.attribute_method?(stripped_name) ||
+                       @context.attribute_method?(name)
+        case stripped_name
+        when /\A(g|c|m|groupings|conditions|combinator)=?\z/
+          true
+        else
+          stripped_name
+          .split(/_and_|_or_/)
+          .none? { |n| !@context.attribute_method?(n) }
+        end
+      end
+
+      def build_grouping(params = {})
+        params ||= {}
+        new_grouping(params).tap do |new_grouping|
+          self.groupings << new_grouping
+        end
+      end
+
+      def new_grouping(params = {})
+        Grouping.new(@context).build(params)
+      end
+
+      def build(params)
+        indifferent_params(params, 'grouping').each do |key, value|
+          case key
+          when /\A(g|c|m|groupings|conditions|combinator)\z/
+            self.send("#{key}=", value)
+          else
+            if @context.ransackable_scope?(key, @context.object)
+              @context.chain_scope(key, @context.sanitize_scope_args(key, value))
+            else
+              write_attribute(key.to_s, value)
+            end
+          end
+        end
+        self
+      end
+
+      def inspect
+        data = [
+          ['conditions'.freeze, conditions], [Constants::COMBINATOR, combinator]
+        ]
+        .reject { |e| e[1].blank? }
+        .map { |v| "#{v[0]}: #{v[1]}" }
+        .join(', '.freeze)
+        "Grouping <#{data}>"
+      end
+
+      private
+
+      def write_attribute(name, val)
+        # TODO: Methods
+        if condition = Condition.extract(@context, name, val)
+          self[name] = condition
+        end
+      end
+
+      def read_attribute(name)
+        # A field built from an aliased attribute writes its value under the real
+        # name but reads it back under the alias. Resolve the alias so the
+        # value survives a form round-trip (#689).
+        if self[name].nil?
+          stripped_name = name.dup
+          predicate = Predicate.detect_and_strip_from_string!(stripped_name)
+          aliased_attribute = context.resolve_aliases(stripped_name)
+          name = "#{aliased_attribute}_#{predicate}" unless aliased_attribute == stripped_name
+        end
+
+        if self[name].respond_to?(:value)
+          self[name].value
+        else
+          self[name]
+        end
+      end
+
+      # Drops a multiparameter index (`created_at(1i)`) and then the predicate
+      # from a key. The index is found by a plain scan. The `/(.+?)\(/` this
+      # replaces let its lazy group re-run from every position of a long key,
+      # which CodeQL reports as polynomial (rb/polynomial-redos); Ruby's engine
+      # short-circuits that in practice, but one pass needs no such help.
+      def strip_predicate_and_index(str)
+        paren = str.index('(')
+        string = paren&.positive? ? str[0...paren] : str.dup
+        Predicate.detect_and_strip_from_string!(string)
+        string
+      end
+
+      # A condition is dropped when it fails validation, as an unknown
+      # attribute or predicate would be. One failure is worth naming: a
+      # single-value predicate given several values. A strict search raises
+      # for it, so the caller learns why the filter vanished (#1724).
+      def add_condition(attrs)
+        condition = Condition.new(@context).build(attrs)
+        if condition.valid?
+          self.conditions << condition
+        elsif @context.strict_conditions? && condition.arity_failure?
+          raise condition.arity_error
+        end
+      end
+
+      def remove_duplicate_conditions!
+        # If self.conditions.uniq! is called without passing a block, then
+        # conditions differing only by ransacker_args within attributes are
+        # wrongly considered equal and are removed.
+        self.conditions.uniq! do |c|
+          c.attributes.map { |a| [a.name, a.ransacker_args] }.flatten +
+          [c.predicate.name] +
+          c.values.map { |v| v.value }
+        end
+      end
+    end
+  end
+end

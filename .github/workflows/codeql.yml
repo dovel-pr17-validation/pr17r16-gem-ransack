@@ -1,0 +1,40 @@
+# CodeQL analysis of the Ruby sources. Alerts land under the repository's
+# "Code scanning" tab. The `analyze` job id and the `language` matrix key are
+# the analysis category GitHub files the alerts under, so keep them.
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    # The branches below must be a subset of the branches above
+    branches: [ main ]
+  schedule:
+    - cron: '43 11 * * 3'
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'ruby' ]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+
+    # Ruby needs no build step, so there is no autobuild here.
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4

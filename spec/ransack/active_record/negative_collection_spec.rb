@@ -1,0 +1,639 @@
+require 'spec_helper'
+
+# A negative condition on a collection is built as a correlated subquery,
+# and the join Ransack had added for the association is dropped. The
+# condition keeps the association and builds the subquery from it again each
+# time the search is evaluated, and every other negative condition on the
+# same association builds its own from it too. In 6.0.0 the association's
+# parent was forgotten when the join was dropped, so a second call to
+# `result`, or a second negative condition on the same collection, raised
+# NoMethodError (#1745).
+module Ransack
+  module ActiveRecord
+    describe 'negative conditions on a collection' do
+      def t(name) = quote_table_name(name)
+      def c(name) = quote_column_name(name)
+      def subquery_count(sql) = sql.scan(/IN \(SELECT/).size
+      def outer_query(sql) = sql.split('IN (SELECT').first
+
+      # Every call gives the same SQL, and the SQL runs.
+      def expect_stable(search, opts = {})
+        sqls = Array.new(3) { search.result(opts).to_sql }
+        expect(sqls.uniq.size).to eq 1
+        expect { search.result(opts).to_a }.not_to raise_error
+        sqls.first
+      end
+
+      describe 'evaluating the search more than once' do
+        it 'gives the same SQL on a has_and_belongs_to_many' do
+          sql = expect_stable(Article.ransack(tags_name_not_in: ['ruby']))
+          expect(sql).to include('NOT IN (SELECT')
+          expect(outer_query(sql)).not_to include('JOIN')
+        end
+
+        it 'gives the same SQL on a has_many' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft'))
+          expect(subquery_count(sql)).to eq 1
+          expect(sql).to include("#{t('articles')}.#{c('person_id')} = #{t('people')}.#{c('id')}")
+        end
+
+        it 'gives the same SQL when the collection has a default scope' do
+          sql = expect_stable(Person.ransack(comments_body_not_eq: 'x'))
+          expect(sql).to include("#{t('comments')}.#{c('person_id')} = #{t('people')}.#{c('id')}")
+        end
+
+        it 'gives the same SQL on a polymorphic has_many' do
+          sql = expect_stable(Article.ransack(notes_note_not_eq: 'x'))
+          expect(sql).to include("#{t('notes')}.#{c('notable_id')} = #{t('articles')}.#{c('id')}")
+        end
+
+        it 'gives the same SQL through a nested has_and_belongs_to_many' do
+          expect_stable(Article.ransack(comments_tags_name_not_eq: 'x'))
+        end
+
+        %w[
+          not_eq not_in not_cont not_start not_end not_i_cont
+          not_eq_any not_eq_all not_cont_any not_cont_all
+        ].each do |predicate|
+          it "gives the same SQL for #{predicate}" do
+            value = predicate.end_with?('_in', '_any', '_all') ? %w[a b] : 'a'
+            sql = expect_stable(Person.ransack("articles_title_#{predicate}" => value))
+            expect(sql).to include('NOT IN (SELECT')
+          end
+        end
+
+        it 'gives the same SQL for not_null: true' do
+          sql = expect_stable(Person.ransack(articles_title_not_null: true))
+          expect(sql).to include("#{t('people')}.#{c('id')} IN (SELECT")
+        end
+
+        it 'gives the same SQL for not_null: false' do
+          sql = expect_stable(Person.ransack(articles_title_not_null: false))
+          expect(sql).to include('NOT IN (SELECT')
+        end
+
+        it 'gives the same SQL with a sort on the model' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', s: 'name asc'))
+          expect(sql).to include("ORDER BY #{t('people')}.#{c('name')} ASC")
+        end
+
+        it 'gives the same SQL with distinct' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft'), distinct: true)
+          expect(sql).to include('SELECT DISTINCT')
+        end
+
+        it 'gives the same SQL with a positive condition on another association' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', comments_body_eq: 'x'))
+          expect(sql).to include("LEFT OUTER JOIN #{t('comments')}")
+          expect(sql).not_to include("JOIN #{t('articles')}")
+        end
+
+        # The positive condition locks the join, so it stays alongside the
+        # subquery.
+        it 'gives the same SQL with a positive condition on the same association' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', articles_body_eq: 'x'))
+          expect(sql).to include("LEFT OUTER JOIN #{t('articles')}")
+          expect(subquery_count(sql)).to eq 1
+        end
+
+        it 'gives the same SQL combined with or' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', name_eq: 'x', m: 'or'))
+          expect(sql).to include(' OR ')
+        end
+
+        it 'gives the same SQL on a relation that already joins the collection' do
+          sql = expect_stable(Article.joins(:tags).ransack(tags_name_not_eq: 'x'))
+          expect(outer_query(sql).scan(/JOIN #{Regexp.escape(t('tags'))}/).size).to eq 1
+        end
+
+        it 'gives the same SQL on a search sharing its context' do
+          context = Context.for(Person)
+          search = Search.new(Person, { articles_title_not_eq: 'Draft' }, context: context)
+          expect_stable(search)
+        end
+      end
+
+      describe 'several negative conditions on the same collection' do
+        it 'builds a subquery for each condition' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', articles_body_not_cont: 'spam'))
+          expect(subquery_count(sql)).to eq 2
+          expect(outer_query(sql)).not_to include('JOIN')
+        end
+
+        it 'builds a subquery for each attribute of an _or_ condition' do
+          sql = expect_stable(Person.ransack(articles_title_or_articles_body_not_eq: 'x'))
+          expect(subquery_count(sql)).to eq 2
+          expect(sql).to include(' OR ')
+        end
+
+        it 'builds a subquery for each attribute of an _and_ condition' do
+          sql = expect_stable(Person.ransack(articles_title_and_articles_body_not_eq: 'x'))
+          expect(subquery_count(sql)).to eq 2
+        end
+
+        it 'builds a subquery for each condition across groupings' do
+          search = Person.ransack(
+            m: 'or',
+            g: [{ articles_title_not_eq: 'a' }, { articles_body_not_eq: 'b' }]
+          )
+          sql = expect_stable(search)
+          expect(subquery_count(sql)).to eq 2
+        end
+
+        it 'builds a subquery for each condition on a has_and_belongs_to_many' do
+          sql = expect_stable(Article.ransack(tags_name_not_eq: 'a', tags_name_not_in: %w[b c]))
+          expect(subquery_count(sql)).to eq 2
+        end
+      end
+
+      # The join is dropped only when nothing else in the search reads the
+      # joined table. A sort on the collection, or a condition or sort on an
+      # association nested under it, keeps it; before, the query referenced
+      # a table it no longer joined (#1749).
+      describe 'a join something else in the search still needs' do
+        def join_count(sql, table) = outer_query(sql).scan(/JOIN #{Regexp.escape(t(table))}/).size
+
+        it 'is kept for a sort on the same collection' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', s: 'articles_title asc'))
+          expect(join_count(sql, 'articles')).to eq 1
+          expect(subquery_count(sql)).to eq 1
+          expect(sql).to include("ORDER BY #{t('articles')}.#{c('title')} ASC")
+        end
+
+        it 'is kept whichever comes first in the params' do
+          sql = expect_stable(Person.ransack(s: 'articles_title desc', articles_title_not_eq: 'Draft'))
+          expect(join_count(sql, 'articles')).to eq 1
+        end
+
+        it 'is kept for a sort set with sorts= before the first result' do
+          search = Person.ransack(articles_title_not_eq: 'Draft')
+          search.sorts = ['name asc', 'articles_body desc']
+          sql = expect_stable(search)
+          expect(join_count(sql, 'articles')).to eq 1
+        end
+
+        it 'is kept for a sort on the same has_and_belongs_to_many' do
+          sql = expect_stable(Article.ransack(tags_name_not_in: %w[a b], s: 'tags_name asc'))
+          expect(join_count(sql, 'tags')).to eq 1
+          expect(subquery_count(sql)).to eq 1
+        end
+
+        it 'is kept for a condition nested under the collection' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', articles_comments_body_eq: 'x'))
+          expect(join_count(sql, 'articles')).to eq 1
+          expect(join_count(sql, 'comments')).to eq 1
+        end
+
+        it 'is kept for a negative condition nested under the collection' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', articles_comments_body_not_eq: 'x'))
+          expect(join_count(sql, 'articles')).to eq 1
+          expect(join_count(sql, 'comments')).to eq 1
+        end
+
+        it 'is kept for a sort nested under the collection' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', s: 'articles_comments_body asc'))
+          expect(join_count(sql, 'articles')).to eq 1
+          expect(join_count(sql, 'comments')).to eq 1
+        end
+
+        # Attributes then predicate, and predicate then attributes, lock
+        # through different paths in Condition.
+        it 'is kept for a nested condition built from advanced params, in either order' do
+          [
+            { a: { '0' => { name: 'articles_comments_body' } }, p: 'eq', v: { '0' => { value: 'x' } } },
+            { p: 'eq', a: { '0' => { name: 'articles_comments_body' } }, v: { '0' => { value: 'x' } } }
+          ].each do |condition|
+            search = Person.ransack(articles_title_not_eq: 'Draft', c: { '0' => condition })
+            sql = expect_stable(search)
+            expect(join_count(sql, 'articles')).to eq 1
+          end
+        end
+
+        it 'is still dropped for a sort on the model' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', s: 'name asc'))
+          expect(sql).not_to include('JOIN')
+        end
+
+        it 'is still dropped for a sort on another collection' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', s: 'comments_body asc'))
+          expect(join_count(sql, 'articles')).to eq 0
+          expect(join_count(sql, 'comments')).to eq 1
+        end
+
+        it 'is still dropped for a negative condition on a sibling collection' do
+          sql = expect_stable(Person.ransack(articles_title_not_eq: 'Draft', comments_body_not_eq: 'x'))
+          expect(sql).not_to include('JOIN')
+          expect(subquery_count(sql)).to eq 2
+        end
+      end
+
+      # Evaluating the search leaves its context as it was, so a sort or
+      # condition added after `result` lines up with the query Active Record
+      # builds. Before, the dropped join was gone from the context: a later
+      # sort on the collection had no join, and a later condition was bound
+      # to an alias (`articles_people`) the query did not have (#1750).
+      describe 'changing the search after result' do
+        def evaluated(params = { articles_title_not_eq: 'Draft' })
+          Person.ransack(params).tap { |search| search.result.to_a }
+        end
+
+        it 'keeps the context relation and its joins' do
+          search = Person.ransack(articles_title_not_eq: 'Draft')
+          before = search.context.object.left_outer_joins_values.dup
+          search.result.to_a
+          expect(search.context.object.left_outer_joins_values).to eq before
+          expect(search.context.join_sources.size).to eq 1
+        end
+
+        it 'accepts a sort on the same collection' do
+          search = evaluated
+          search.sorts = 'articles_title asc'
+          sql = expect_stable(search)
+          expect(outer_query(sql)).to include("LEFT OUTER JOIN #{t('articles')} ON")
+          expect(sql).to include("ORDER BY #{t('articles')}.#{c('title')} ASC")
+        end
+
+        it 'accepts a positive condition on the same collection' do
+          search = evaluated
+          search.build('articles_body_eq' => 'x')
+          sql = expect_stable(search)
+          expect(sql).to include("#{t('articles')}.#{c('body')} = 'x'")
+          expect(sql).not_to include('articles_people')
+        end
+
+        it 'accepts a negative condition on the same collection' do
+          search = evaluated
+          search.build('articles_body_not_eq' => 'x')
+          sql = expect_stable(search)
+          expect(subquery_count(sql)).to eq 2
+          expect(sql).not_to include('JOIN')
+        end
+
+        it 'accepts a condition nested under the collection' do
+          search = evaluated
+          search.build('articles_comments_body_eq' => 'x')
+          sql = expect_stable(search)
+          expect(outer_query(sql)).to include("JOIN #{t('articles')}")
+          expect(outer_query(sql)).to include("JOIN #{t('comments')}")
+        end
+
+        it 'gives the same SQL as a search built with everything up front' do
+          search = evaluated
+          search.build('articles_body_eq' => 'x')
+          search.sorts = 'articles_title asc'
+          upfront = Person.ransack(articles_title_not_eq: 'Draft', articles_body_eq: 'x', s: 'articles_title asc')
+          expect(search.result.to_sql).to eq upfront.result.to_sql
+        end
+
+        it 'leaves a relation returned earlier unchanged' do
+          search = Person.ransack(articles_title_not_eq: 'Draft')
+          first = search.result
+          sql = first.to_sql
+          search.build('articles_body_eq' => 'x')
+          search.result.to_a
+          expect(first.to_sql).to eq sql
+        end
+
+        it 'does not affect another search sharing the context' do
+          context = Context.for(Person)
+          negative = Search.new(Person, { articles_title_not_eq: 'Draft' }, context: context)
+          positive = Search.new(Person, { comments_body_eq: 'x' }, context: context)
+          negative.result.to_a
+          sql = expect_stable(positive)
+          expect(sql).to include("#{t('comments')}.#{c('body')} = 'x'")
+        end
+      end
+
+      # The joins kept are the ones the search reads when it is evaluated,
+      # not the ones its conditions and sorts read when they were built: a
+      # sort or condition cleared before `result` leaves no join behind to
+      # multiply the rows.
+      describe 'a condition or sort removed before result' do
+        it 'leaves no join for a cleared sort on the collection' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', s: 'articles_title asc')
+          search.sorts = []
+          sql = expect_stable(search)
+          expect(sql).not_to include('JOIN')
+          expect(subquery_count(sql)).to eq 1
+        end
+
+        it 'leaves no join for a sort cleared after result' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', s: 'articles_title asc')
+          search.result.to_a
+          search.sorts = []
+          expect(expect_stable(search)).not_to include('JOIN')
+        end
+
+        it 'leaves no join for a negative condition cleared after result' do
+          search = Person.ransack(articles_title_not_eq: 'Draft')
+          search.result.to_a
+          search.base.conditions.clear
+          expect(expect_stable(search)).not_to include('JOIN')
+        end
+
+        it 'leaves no join for a cleared positive condition' do
+          search = Person.ransack(articles_title_eq: 'x')
+          search.base.conditions.clear
+          expect(expect_stable(search)).not_to include('JOIN')
+        end
+
+        it 'keeps the join a remaining sort reads' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', articles_body_eq: 'x', s: 'articles_title asc')
+          search.base.conditions.clear
+          expect(outer_query(expect_stable(search))).to include("LEFT OUTER JOIN #{t('articles')}")
+        end
+      end
+
+      # A ransacker can run a search on the same context while the outer
+      # search is being evaluated. The inner evaluation keeps its own record
+      # of the joins it reads, so the outer one still drops the join its
+      # negative condition replaced.
+      describe 'an evaluation nested in another' do
+        it 'does not change which joins the outer evaluation keeps' do
+          context = Context.for(Person)
+          outer = Search.new(Person, { articles_title_not_eq: 'Draft', name_eq: 'x' }, context: context)
+          inner = Search.new(Person, {}, context: context)
+          allow(context).to receive(:type_for).and_wrap_original do |original, attribute|
+            inner.result.to_a if attribute.name == 'name'
+            original.call(attribute)
+          end
+
+          sql = outer.result.to_sql
+          expect(sql).not_to include('JOIN')
+          expect(subquery_count(sql)).to eq 1
+        end
+      end
+
+      describe 'the records returned' do
+        let(:suffix)   { SecureRandom.hex(4) }
+        let!(:ruby)    { Tag.create!(name: "ruby-#{suffix}") }
+        let!(:rails)   { Tag.create!(name: "rails-#{suffix}") }
+        let!(:tagged_ruby)  { Article.create!(title: "ruby #{suffix}").tap { |a| a.tags << ruby } }
+        let!(:tagged_rails) { Article.create!(title: "rails #{suffix}").tap { |a| a.tags << rails } }
+        let!(:untagged)     { Article.create!(title: "none #{suffix}") }
+
+        let!(:drafter)  { Person.create!(name: "drafter #{suffix}").tap { |p| p.articles.create!(title: 'Draft', body: 'ok') } }
+        let!(:spammer)  { Person.create!(name: "spammer #{suffix}").tap { |p| p.articles.create!(title: 'Post', body: 'spam here') } }
+        let!(:writer)   { Person.create!(name: "writer #{suffix}").tap { |p| p.articles.create!(title: 'Post', body: 'ok') } }
+        let!(:idle)     { Person.create!(name: "idle #{suffix}") }
+
+        # Rows persist across examples, and other specs count them.
+        after do
+          [tagged_ruby, tagged_rails].each { |article| article.tags.clear }
+          [tagged_ruby, tagged_rails, untagged, ruby, rails].each(&:delete)
+          people = [drafter, spammer, writer, idle]
+          Comment.unscoped.where('body LIKE ?', "%#{suffix}%").delete_all
+          Article.unscoped.where(person_id: people.map(&:id)).delete_all
+          people.each(&:delete)
+        end
+
+        it 'are the same on every call (the #1745 repro)' do
+          search = Article.ransack(tags_name_not_in: [ruby.name], title_end: suffix)
+          first = search.result.to_a
+          second = search.result.to_a
+          expect(first).to match_array [tagged_rails, untagged]
+          expect(second).to match_array first
+        end
+
+        it 'exclude a record with any matching associated record on every call' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', name_end: suffix)
+          2.times do
+            expect(search.result.to_a).to match_array [spammer, writer, idle]
+          end
+        end
+
+        it 'exclude records matching either of two conditions on the same collection' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', articles_body_not_cont: 'spam', name_end: suffix)
+          2.times do
+            expect(search.result.to_a).to match_array [writer, idle]
+          end
+        end
+
+        it 'include records matching neither attribute of an _or_ condition' do
+          search = Person.ransack(articles_title_or_articles_body_not_eq: 'Draft', name_end: suffix)
+          expect(search.result.to_a).to match_array [drafter, spammer, writer, idle]
+
+          search = Person.ransack(articles_title_and_articles_body_not_eq: 'Draft', name_end: suffix)
+          expect(search.result.to_a).to match_array [spammer, writer, idle]
+        end
+
+        it 'are sorted by the collection the negative condition is on' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', name_end: suffix, s: 'articles_body asc')
+          # idle has no articles, so its joined row sorts as NULL: first on
+          # SQLite and MySQL, last on PostgreSQL.
+          expect(search.result.to_a).to match_array [spammer, writer, idle]
+          expect(search.result.to_a - [idle]).to eq [writer, spammer]
+        end
+
+        it 'honour a condition nested under the collection' do
+          drafter.articles.first.comments.create!(body: "nested #{suffix}")
+          writer.articles.first.comments.create!(body: "nested #{suffix}")
+          search = Person.ransack(articles_title_not_eq: 'Draft', articles_comments_body_eq: "nested #{suffix}")
+          expect(search.result.to_a).to eq [writer]
+        end
+
+        it 'are right when the search is changed after result' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', name_end: suffix)
+          expect(search.result.to_a).to match_array [spammer, writer, idle]
+
+          search.build('articles_body_not_cont' => 'spam')
+          expect(search.result.to_a).to match_array [writer, idle]
+
+          search.sorts = 'articles_title asc'
+          expect(search.result.to_a).to match_array [writer, idle]
+
+          search.build('articles_body_eq' => 'ok')
+          expect(search.result.to_a).to eq [writer]
+        end
+
+        it 'are not repeated once a sort on the collection is cleared' do
+          writer.articles.create!(title: 'Second post', body: 'ok')
+          search = Person.ransack(articles_title_not_eq: 'Draft', name_end: suffix, s: 'articles_title asc')
+          search.sorts = []
+          expect(search.result.to_a).to match_array [spammer, writer, idle]
+
+          search.result.to_a
+          search.base.conditions.clear
+          search.build('name_end' => suffix)
+          expect(search.result.to_a).to match_array [drafter, spammer, writer, idle]
+        end
+
+        it 'keep the same order and count when the result is reused' do
+          search = Person.ransack(articles_title_not_eq: 'Draft', name_end: suffix, s: 'name asc')
+          expect(search.result.pluck(:name)).to eq ["idle #{suffix}", "spammer #{suffix}", "writer #{suffix}"]
+          expect(search.result.count).to eq 3
+          expect(search.result.order_values).to eq search.result.order_values
+        end
+      end
+
+      # #1773: a negative condition on a collection the model has directly
+      # is a subquery whatever the collection is called. It used to be built
+      # only when the association's name started with its table's, so an
+      # STI, scoped, self-referential or through collection fell back to a
+      # join with a row-level `!=`: a record was returned through any row
+      # that did not match, and one with no rows at all was dropped (#925).
+      describe 'on a collection not named after its table' do
+        let(:suffix) { SecureRandom.hex(4) }
+        let(:match)  { "match #{suffix}" }
+        let(:other)  { "other #{suffix}" }
+
+        # Rows persist across examples, and other specs count them.
+        after do
+          Comment.unscoped.where('body LIKE ?', "%#{suffix}%").delete_all
+          Article.unscoped.where('title LIKE ?', "%#{suffix}%").delete_all
+          Person.unscoped.where('name LIKE ?', "%#{suffix}%").delete_all
+        end
+
+        def person(label) = Person.create!(name: "#{label} #{suffix}")
+
+        def people(among, params)
+          Person.where(id: among.map(&:id)).ransack(params).result.to_a
+        end
+
+        it 'drops the join for each kind of collection' do
+          %w[
+            story_articles_title published_articles_title
+            children_name authored_article_comments_body
+          ].each do |attribute|
+            sql = expect_stable(Person.ransack("#{attribute}_not_eq" => 'x'))
+            expect(subquery_count(sql)).to eq 1
+            expect(outer_query(sql)).not_to include('JOIN')
+          end
+        end
+
+        it 'returns the right records for an STI subclass collection (#925)' do
+          both = person('both')
+          [match, other].each { |title| StoryArticle.create!(person: both, title: title) }
+          other_only = person('other').tap { |p| StoryArticle.create!(person: p, title: other) }
+          plain = person('plain').tap { |p| Article.create!(person: p, title: match) }
+          none = person('none')
+          everyone = [both, other_only, plain, none]
+
+          expect(people(everyone, story_articles_title_not_eq: match)).to match_array [other_only, plain, none]
+          expect(people(everyone, story_articles_title_not_in: [match])).to match_array [other_only, plain, none]
+          expect(people(everyone, story_articles_title_not_cont: 'match')).to match_array [other_only, plain, none]
+          expect(people(everyone, articles_title_not_eq: match)).to match_array [other_only, none]
+        end
+
+        it 'returns the right records for a scoped collection' do
+          both = person('both').tap { |p| [match, other].each { |title| p.articles.create!(title: title) } }
+          unpublished = person('unpublished').tap do |p|
+            p.articles.create!(title: match, published: false)
+            p.articles.create!(title: other)
+          end
+          none = person('none')
+
+          result = people([both, unpublished, none], published_articles_title_not_eq: match)
+          expect(result).to match_array [unpublished, none]
+        end
+
+        it 'returns the right records for a self-referential collection' do
+          both = person('both').tap { |p| [match, other].each { |name| p.children.create!(name: name) } }
+          other_only = person('other').tap { |p| p.children.create!(name: other) }
+          childless = person('childless')
+
+          result = people([both, other_only, childless], children_name_not_eq: match)
+          expect(result).to match_array [other_only, childless]
+        end
+
+        it 'returns the right records for a has_many :through' do
+          commented = lambda do |label, *bodies, disabled: false|
+            person(label).tap do |p|
+              article = p.articles.create!(title: "article #{suffix}")
+              bodies.each { |body| article.comments.create!(body: body, disabled: disabled) }
+            end
+          end
+          both = commented.call('both', match, other)
+          other_only = commented.call('other', other)
+          hidden = commented.call('hidden', match, disabled: true)
+          uncommented = commented.call('uncommented')
+          none = person('none')
+
+          result = people([both, other_only, hidden, uncommented, none], authored_article_comments_body_not_eq: match)
+          expect(result).to match_array [other_only, hidden, uncommented, none]
+        end
+
+        # A negative condition nested under another collection keeps its
+        # join on purpose (#1411), whatever the collections are called.
+        it 'still joins a collection nested under another' do
+          sql = expect_stable(Person.ransack(story_articles_comments_body_not_eq: 'x'))
+          expect(subquery_count(sql)).to eq 0
+          expect(sql).to include("JOIN #{t('comments')}")
+
+          author = person('author')
+          article = author.articles.create!(title: "article #{suffix}")
+          [match, other].each { |body| article.comments.create!(body: body) }
+          expect(people([author], articles_comments_body_not_in: [match])).to eq [author]
+        end
+      end
+    end
+
+    describe Context do
+      let(:context) { Context.for(Person) }
+
+      describe '#evaluate' do
+        let(:search)      { Search.new(Person, { articles_title_not_eq: 'Draft' }, context: context) }
+        let(:association) { search.conditions.first.attributes.first.parent }
+
+        it 'keeps the subquery buildable after an evaluation' do
+          before_evaluation = context.build_correlated_subquery(association).to_sql
+          search.result
+          expect(context.build_correlated_subquery(association).to_sql).to eq before_evaluation
+        end
+
+        it 'drops a join the search does not read from the evaluated relation' do
+          expect(search.result.left_outer_joins_values).to be_empty
+        end
+
+        # The context keeps the join, so a later evaluation or binding sees
+        # the same joins and aliases (#1750).
+        it 'leaves the context relation as it was' do
+          search.result
+          expect(context.object.left_outer_joins_values.size).to eq 1
+        end
+
+        it 'hands the same association to a later binding' do
+          search.result
+          attribute = Nodes::Attribute.new(context, 'articles_body')
+          context.bind(attribute, attribute.name)
+          expect(attribute.parent).to equal association
+        end
+      end
+
+      describe '#lock_association' do
+        let(:search)   { Search.new(Person, { articles_comments_body_eq: 'x' }, context: context) }
+        let(:comments) { search.conditions.first.attributes.first.parent }
+
+        it 'keeps the join, and the ones it hangs off, when the search reads neither' do
+          association = comments
+          search.base.conditions.clear
+          context.lock_association(association)
+          expect(search.result.left_outer_joins_values.size).to eq 2
+        end
+      end
+
+      describe '#use_association and #use_ancestors_of' do
+        let(:search)      { Search.new(Person, { articles_title_eq: 'x' }, context: context) }
+        let(:association) { search.conditions.first.attributes.first.parent }
+
+        it 'do nothing outside an evaluation' do
+          expect { context.use_association(association) }.not_to raise_error
+          expect { context.use_ancestors_of(association) }.not_to raise_error
+          expect(context.instance_variable_get(:@used_associations)).to be_nil
+        end
+      end
+
+      describe '#remove_association' do
+        let(:search)      { Search.new(Person, { articles_title_eq: 'x' }, context: context) }
+        let(:association) { search.conditions.first.attributes.first.parent }
+
+        # Kept for callers of the 6.0.0 API.
+        it 'changes nothing' do
+          context.remove_association(association)
+          expect(context.object.left_outer_joins_values.size).to eq 1
+          expect(search.result.left_outer_joins_values.size).to eq 1
+        end
+      end
+    end
+  end
+end
